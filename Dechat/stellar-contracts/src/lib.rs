@@ -1028,16 +1028,17 @@ impl FiatBridge {
         env.storage()
             .persistent()
             .set(&DataKey::DeployConfigHash, &config_hash);
+        env.storage()
+            .instance()
+            .set(&DataKey::InitNonce(admin.clone()), &0u64);
+        env.storage().instance().extend_ttl(MIN_TTL, MAX_TTL);
+
         DeployHashEvent {
             version: EVENT_VERSION,
             config_hash,
         }
         .publish(&env);
 
-        env.storage()
-            .instance()
-            .set(&DataKey::InitNonce(admin.clone()), &0u64);
-        env.storage().instance().extend_ttl(MIN_TTL, MAX_TTL);
         Ok(())
     }
 
@@ -1294,6 +1295,8 @@ impl FiatBridge {
             env.storage().temporary().extend_ttl(&large_key, ttl, ttl);
         }
 
+        Self::check_invariants(&env, &token)?;
+
         DepositEvent {
             version: EVENT_VERSION,
             from: from.clone(),
@@ -1311,8 +1314,6 @@ impl FiatBridge {
             memo_hash,
         }
         .publish(&env);
-
-        Self::check_invariants(&env, &token)?;
 
         Ok(receipt_hash)
     }
@@ -5535,3 +5536,15 @@ mod test_denylist_invariants;
 
 #[cfg(test)]
 mod test_token_allowlist_invariants;
+
+#[cfg(test)]
+mod test_event_schema_compatibility;
+
+#[cfg(test)]
+mod test_resource_budgets;
+
+#[cfg(test)]
+mod test_upgrade_rollback_compatibility;
+
+#[cfg(test)]
+mod test_adversarial_fixtures;

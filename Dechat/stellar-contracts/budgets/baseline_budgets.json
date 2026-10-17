@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "description": "Reviewed Soroban resource budget baselines and regression ceilings per entrypoint",
+  "regression_threshold_percent": 10.0,
+  "budgets": {
+    "deposit": {
+      "baseline_cpu": 803441,
+      "max_cpu_ceiling": 883785,
+      "baseline_mem": 282015,
+      "max_mem_ceiling": 310216,
+      "max_ledger_reads": 10,
+      "max_ledger_writes": 6
+    },
+    "request_withdrawal": {
+      "baseline_cpu": 688348,
+      "max_cpu_ceiling": 757182,
+      "baseline_mem": 255008,
+      "max_mem_ceiling": 280508,
+      "max_ledger_reads": 8,
+      "max_ledger_writes": 4
+    },
+    "execute_withdrawal": {
+      "baseline_cpu": 885286,
+      "max_cpu_ceiling": 973814,
+      "baseline_mem": 251342,
+      "max_mem_ceiling": 276476,
+      "max_ledger_reads": 10,
+      "max_ledger_writes": 5
+    },
+    "admin_set_limit": {
+      "baseline_cpu": 354744,
+      "max_cpu_ceiling": 390218,
+      "baseline_mem": 142217,
+      "max_mem_ceiling": 156438,
+      "max_ledger_reads": 5,
+      "max_ledger_writes": 3
+    },
+    "admin_pause": {
+      "baseline_cpu": 276733,
+      "max_cpu_ceiling": 304406,
+      "baseline_mem": 119143,
+      "max_mem_ceiling": 131057,
+      "max_ledger_reads": 4,
+      "max_ledger_writes": 2
+    },
+    "query_config_snapshot": {
+      "baseline_cpu": 310950,
+      "max_cpu_ceiling": 342045,
+      "baseline_mem": 95782,
+      "max_mem_ceiling": 105360,
+      "max_ledger_reads": 15,
+      "max_ledger_writes": 0
+    }
+  }
+}

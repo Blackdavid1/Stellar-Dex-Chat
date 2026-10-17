@@ -1,0 +1,241 @@
+{
+  "version": 1,
+  "description": "Golden contract event fixtures for Stellar Fiat Bridge contract indexer compatibility testing",
+  "events": [
+    {
+      "family": "DepositEvent",
+      "type": "deposit",
+      "version": 1,
+      "topics": ["DepositEvent"],
+      "data": {
+        "version": 1,
+        "from": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+        "token": "CAWYXBN4PSVXD7NIYEWVFFIIIEUCC6PUN3IMG3J2WHKDB4NVIISMXBPR",
+        "amount": "1000000000",
+        "receipt_id": "0101010101010101010101010101010101010101010101010101010101010101",
+        "by": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+        "ledger": 1000
+      }
+    },
+    {
+      "family": "ReceiptIssuedEvent",
+      "type": "receipt_issued",
+      "version": 1,
+      "topics": ["ReceiptIssuedEvent"],
+      "data": {
+        "version": 1,
+        "receipt_id": "0101010101010101010101010101010101010101010101010101010101010101",
+        "memo_hash": "0202020202020202020202020202020202020202020202020202020202020202"
+      }
+    },
+    {
+      "family": "WithdrawEvent",
+      "type": "withdraw",
+      "version": 1,
+      "topics": ["WithdrawEvent"],
+      "data": {
+        "version": 1,
+        "to": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+        "token": "CAWYXBN4PSVXD7NIYEWVFFIIIEUCC6PUN3IMG3J2WHKDB4NVIISMXBPR",
+        "amount": "500000000",
+        "by": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+        "ledger": 1050
+      }
+    },
+    {
+      "family": "WithdrawalRequestedEvent",
+      "type": "withdrawal_requested",
+      "version": 1,
+      "topics": ["WithdrawalRequestedEvent"],
+      "data": {
+        "version": 1,
+        "to": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+        "request_id": 42,
+        "amount": "250000000",
+        "token": "CAWYXBN4PSVXD7NIYEWVFFIIIEUCC6PUN3IMG3J2WHKDB4NVIISMXBPR",
+        "memo_hash": null
+      }
+    },
+    {
+      "family": "WithdrawalExecutedEvent",
+      "type": "withdrawal_executed",
+      "version": 1,
+      "topics": ["WithdrawalExecutedEvent"],
+      "data": {
+        "version": 1,
+        "request_id": 42,
+        "to": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+        "amount": "250000000",
+        "nonce": 1
+      }
+    },
+    {
+      "family": "WithdrawalCancelledEvent",
+      "type": "withdrawal_cancelled",
+      "version": 1,
+      "topics": ["WithdrawalCancelledEvent"],
+      "data": {
+        "version": 1,
+        "request_id": 42
+      }
+    },
+    {
+      "family": "WithdrawalExpiredEvent",
+      "type": "withdrawal_expired",
+      "version": 1,
+      "topics": ["WithdrawalExpiredEvent"],
+      "data": {
+        "version": 1,
+        "request_id": 42,
+        "to": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+        "amount": "250000000",
+        "queued_ledger": 1000
+      }
+    },
+    {
+      "family": "FeeAccruedEvent",
+      "type": "fee_accrued",
+      "version": 1,
+      "topics": ["FeeAccruedEvent"],
+      "data": {
+        "version": 1,
+        "token": "CAWYXBN4PSVXD7NIYEWVFFIIIEUCC6PUN3IMG3J2WHKDB4NVIISMXBPR",
+        "amount": "10000000"
+      }
+    },
+    {
+      "family": "FeeWithdrawnEvent",
+      "type": "fee_withdrawn",
+      "version": 1,
+      "topics": ["FeeWithdrawnEvent"],
+      "data": {
+        "version": 1,
+        "to": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+        "amount": "10000000",
+        "token": "CAWYXBN4PSVXD7NIYEWVFFIIIEUCC6PUN3IMG3J2WHKDB4NVIISMXBPR"
+      }
+    },
+    {
+      "family": "RefundEvent",
+      "type": "refund",
+      "version": 1,
+      "topics": ["RefundEvent"],
+      "data": {
+        "version": 1,
+        "receipt_id": "0101010101010101010101010101010101010101010101010101010101010101",
+        "to": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+        "amount": "1000000000"
+      }
+    },
+    {
+      "family": "PausedEvent",
+      "type": "paused",
+      "version": 1,
+      "topics": ["PausedEvent"],
+      "data": {
+        "version": 1,
+        "by": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
+      }
+    },
+    {
+      "family": "UnpausedEvent",
+      "type": "unpaused",
+      "version": 1,
+      "topics": ["UnpausedEvent"],
+      "data": {
+        "version": 1,
+        "by": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
+      }
+    },
+    {
+      "family": "SetLimitEvent",
+      "type": "set_limit",
+      "version": 1,
+      "topics": ["SetLimitEvent"],
+      "data": {
+        "version": 1,
+        "token": "CAWYXBN4PSVXD7NIYEWVFFIIIEUCC6PUN3IMG3J2WHKDB4NVIISMXBPR",
+        "limit": "5000000000",
+        "by": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+        "ledger": 1100
+      }
+    },
+    {
+      "family": "SetOperatorEvent",
+      "type": "set_operator",
+      "version": 1,
+      "topics": ["SetOperatorEvent"],
+      "data": {
+        "version": 1,
+        "operator": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+        "active": true,
+        "previous_active": false,
+        "operator_count": 1,
+        "by": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+        "ledger": 1120
+      }
+    },
+    {
+      "family": "NonceConsumedEvent",
+      "type": "nonce_consumed",
+      "version": 1,
+      "topics": ["NonceConsumedEvent"],
+      "data": {
+        "version": 1,
+        "scope": "operator",
+        "owner": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+        "new_nonce": 2
+      }
+    },
+    {
+      "family": "MigrationEvent",
+      "type": "migration",
+      "version": 1,
+      "topics": ["MigrationEvent"],
+      "data": {
+        "version": 1,
+        "cursor": 100,
+        "migrated_count": 50
+      }
+    },
+    {
+      "family": "CircuitBreakerTrippedEvent",
+      "type": "circuit_breaker_tripped",
+      "version": 1,
+      "topics": ["CircuitBreakerTrippedEvent"],
+      "data": {
+        "version": 1,
+        "new_total": "10000000000",
+        "threshold": "8000000000"
+      }
+    },
+    {
+      "family": "upg_prop",
+      "type": "upgrade_proposed",
+      "version": 1,
+      "topics": [1, "upg_prop"],
+      "data": {
+        "wasm_hash": "3333333333333333333333333333333333333333333333333333333333333333",
+        "executable_after": 2000
+      }
+    },
+    {
+      "family": "upg_exec",
+      "type": "upgrade_executed",
+      "version": 1,
+      "topics": [1, "upg_exec"],
+      "data": {
+        "wasm_hash": "3333333333333333333333333333333333333333333333333333333333333333"
+      }
+    },
+    {
+      "family": "multisig_proposed",
+      "type": "multisig_proposed",
+      "version": 1,
+      "topics": [1, "multisig_proposed"],
+      "data": {
+        "id": 1
+      }
+    }
+  ]
+}

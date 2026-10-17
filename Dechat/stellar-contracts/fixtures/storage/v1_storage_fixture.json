@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "description": "Representative pre-upgrade deployed storage fixture for FiatBridge contract v1",
+  "storage_layout": {
+    "admin": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+    "token": "CAWYXBN4PSVXD7NIYEWVFFIIIEUCC6PUN3IMG3J2WHKDB4NVIISMXBPR",
+    "min_deposit": "100",
+    "limit": "5000000000",
+    "lock_period": 100,
+    "receipt_counter": 2,
+    "escrow_storage_version": 0,
+    "queue_head": 1,
+    "queue_len": 1,
+    "token_config": {
+      "total_deposited": "1000000000",
+      "total_withdrawn": "300000000",
+      "total_liabilities": "200000000",
+      "limit": "5000000000",
+      "min_deposit": "100"
+    },
+    "receipts": [
+      {
+        "index": 0,
+        "receipt_id": "0101010101010101010101010101010101010101010101010101010101010101",
+        "depositor": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+        "amount": "500000000",
+        "ledger": 100
+      },
+      {
+        "index": 1,
+        "receipt_id": "0202020202020202020202020202020202020202020202020202020202020202",
+        "depositor": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+        "amount": "500000000",
+        "ledger": 105
+      }
+    ],
+    "withdrawal_queue": [
+      {
+        "id": 1,
+        "to": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+        "amount": "200000000",
+        "token": "CAWYXBN4PSVXD7NIYEWVFFIIIEUCC6PUN3IMG3J2WHKDB4NVIISMXBPR",
+        "unlock_ledger": 110,
+        "processed": false,
+        "rejected": false,
+        "memo_hash": null,
+        "risk_tier": 0
+      }
+    ]
+  }
+}
