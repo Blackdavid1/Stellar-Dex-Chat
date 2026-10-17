@@ -80,7 +80,14 @@ export default function StellarFiatModal({
   // so the submit button stays enabled across same-tick clicks. A ref closes
   // that window before React re-renders.
   const lastSubmitAtRef = useRef(0);
-  const { connection, signTx, xlmBalance, refreshXlmBalance } = useStellarWallet();
+  const {
+    connection,
+    signTx,
+    xlmBalance,
+    refreshXlmBalance,
+    sessionExpired,
+    reconnect,
+  } = useStellarWallet();
   const { addNotification } = useNotifications();
   const { addEntry } = useTxHistory();
   const { highValueThreshold, twoFactorEnabled } = useUserPreferences();
@@ -223,7 +230,7 @@ export default function StellarFiatModal({
         setStatus('success');
         localStorage.removeItem(PENDING_TX_KEY);
         // Refresh wallet balance after successful transaction
-        await refreshXlmBalance();
+        await refreshXlmBalance?.();
       })
       .catch(() => {
         if (cancelled) {
@@ -377,6 +384,7 @@ export default function StellarFiatModal({
     isStatusLoading ||
     isStatusPending ||
     !connection.isConnected ||
+    sessionExpired ||
     isAmountInvalid ||
     (isDepositFlow &&
       (isLoadingBridgeLimit || isLimitUnavailable || isOverLimit)) ||
@@ -427,7 +435,15 @@ export default function StellarFiatModal({
   if (!isOpen) return null;
 
   const handleAction = async () => {
-    if (!connection.isConnected) return;
+    if (!connection.isConnected || sessionExpired) {
+      setErrorMsg(
+        sessionExpired
+          ? 'Wallet session has expired. Please reconnect to continue.'
+          : 'Wallet disconnected. Please reconnect to continue.',
+      );
+      setStatus('error');
+      return;
+    }
 
     // Show two-factor confirmation modal for high-value transfers
     if (isRiskyAmount && twoFactorEnabled && !showTwoFactorModal) {
@@ -548,7 +564,7 @@ export default function StellarFiatModal({
           clearCache();
           localStorage.removeItem(PENDING_TX_KEY);
           // Refresh wallet balance after successful transaction
-          await refreshXlmBalance();
+          await refreshXlmBalance?.();
           addNotification(
             'tx_confirm',
             `Transaction confirmed successfully! (${hash.slice(0, 8)}...)`,
@@ -716,6 +732,52 @@ export default function StellarFiatModal({
           <SkeletonPayout />
         ) : (
           <>
+            {sessionExpired && (
+              <div
+                data-testid="session-expired-banner"
+                className="theme-soft-warning mb-4 rounded-xl border border-amber-500/40 px-4 py-3 flex items-center justify-between gap-3"
+              >
+                <div>
+                  <p className="font-semibold text-xs text-amber-300">
+                    Wallet Session Expired
+                  </p>
+                  <p className="text-[11px] text-amber-200/80">
+                    Your draft inputs have been preserved. Re-authenticate to proceed.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  data-testid="reconnect-button"
+                  onClick={() => void reconnect()}
+                  className="px-3 py-1.5 bg-amber-500 hover:bg-amber-400 text-black text-xs font-semibold rounded-lg transition-colors flex-shrink-0"
+                >
+                  Reconnect
+                </button>
+              </div>
+            )}
+            {!connection.isConnected && !sessionExpired && (
+              <div
+                data-testid="wallet-disconnected-banner"
+                className="theme-soft-warning mb-4 rounded-xl border border-blue-500/40 px-4 py-3 flex items-center justify-between gap-3"
+              >
+                <div>
+                  <p className="font-semibold text-xs text-blue-300">
+                    Wallet Disconnected
+                  </p>
+                  <p className="text-[11px] text-blue-200/80">
+                    Connect your wallet to sign this transaction.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  data-testid="connect-wallet-button"
+                  onClick={() => void reconnect()}
+                  className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold rounded-lg transition-colors flex-shrink-0"
+                >
+                  Connect
+                </button>
+              </div>
+            )}
             <div className="mb-4">
               <label className="theme-text-secondary block text-sm mb-1">
                 Amount (XLM)

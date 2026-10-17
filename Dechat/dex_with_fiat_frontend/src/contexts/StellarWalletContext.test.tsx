@@ -325,6 +325,97 @@ describe('StellarWalletContext', () => {
     expect(result.current.sessionExpired).toBe(false);
   });
 
+  describe('session expiry and write protection', () => {
+    it('aborts signTx if wallet session has expired before write action', async () => {
+      const { result } = renderHook(() => useStellarWallet(), { wrapper });
+
+      await act(async () => {
+        await result.current.connect();
+      });
+
+      // Simulate expired session timestamp
+      localStorage.setItem(
+        'stellar_connection_timestamp',
+        String(Date.now() - 25 * 60 * 60 * 1000),
+      );
+
+      await expect(result.current.signTx('UNSIGNED_XDR')).rejects.toThrow(
+        'Wallet session expired. Please reconnect to continue.',
+      );
+      await waitFor(() => expect(result.current.sessionExpired).toBe(true));
+    });
+
+    it('aborts signTx if wallet connection is dropped before write action', async () => {
+      const { result } = renderHook(() => useStellarWallet(), { wrapper });
+
+      await act(async () => {
+        await result.current.connect();
+      });
+
+      // Simulate lost connection or revoked authorization
+      freighter.getAddress.mockResolvedValue({ error: 'Connection lost' });
+
+      await expect(result.current.signTx('UNSIGNED_XDR')).rejects.toThrow(
+        'Wallet connection lost or authorization expired. Please reconnect.',
+      );
+    });
+
+    it('reconnect re-authenticates and clears sessionExpired', async () => {
+      const { result } = renderHook(() => useStellarWallet(), { wrapper });
+
+      await act(async () => {
+        await result.current.connect();
+      });
+
+      // Trigger session expired
+      localStorage.setItem(
+        'stellar_connection_timestamp',
+        String(Date.now() - 25 * 60 * 60 * 1000),
+      );
+
+      await act(async () => {
+        const isValid = await result.current.verifySession();
+        expect(isValid).toBe(false);
+      });
+      expect(result.current.sessionExpired).toBe(true);
+
+      // Reconnect
+      await act(async () => {
+        await result.current.reconnect();
+      });
+
+      expect(result.current.sessionExpired).toBe(false);
+      expect(result.current.connection.isConnected).toBe(true);
+    });
+
+    it('ensures zero secret keys, signer seeds, or signed XDR are stored in localStorage', async () => {
+      const { result } = renderHook(() => useStellarWallet(), { wrapper });
+
+      await act(async () => {
+        await result.current.connect();
+      });
+
+      await result.current.signTx('SAMPLE_UNSIGNED_XDR');
+
+      // Check all localStorage keys and values
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i)!;
+        const val = localStorage.getItem(key)!;
+
+        // No secret keys (S... Stellar secret key pattern)
+        expect(key).not.toMatch(/^S[A-Z0-9]{55}$/);
+        expect(val).not.toMatch(/S[A-Z0-9]{55}/);
+
+        // No signed XDR persisted
+        expect(val).not.toContain('SIGNED_XDR');
+
+        // No private key / secret keywords
+        expect(key.toLowerCase()).not.toContain('secret');
+        expect(key.toLowerCase()).not.toContain('private');
+      }
+    });
+  });
+
   it('throws a clear error when consumed outside the provider', () => {
     expect(() => renderHook(() => useStellarWallet())).toThrow(
       'useStellarWallet must be used inside StellarWalletProvider',
