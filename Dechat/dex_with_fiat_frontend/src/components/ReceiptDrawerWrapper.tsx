@@ -8,12 +8,9 @@ const ReceiptDrawer = dynamic(() => import('./ReceiptDrawer'), {
   ssr: false,
 });
 
-interface ReceiptDrawerWrapperProps {
-  isOpen: boolean;
-  onClose: () => void;
-  transactions: TransactionHistoryEntry[];
-  onClearHistory?: () => void;
-}
+import type { ReceiptDrawerProps } from './ReceiptDrawer';
+
+export type ReceiptDrawerWrapperProps = ReceiptDrawerProps;
 
 export default function ReceiptDrawerWrapper(props: ReceiptDrawerWrapperProps) {
   return (
