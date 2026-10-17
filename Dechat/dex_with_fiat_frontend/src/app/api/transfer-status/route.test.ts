@@ -1,18 +1,35 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { NextRequest } from 'next/server';
 
-const applyRateLimitMock: any = vi.fn(() => null);
 const applyRateLimitMock = vi.fn<(...args: unknown[]) => null>(() => null);
 
 vi.mock('@/lib/rateLimit', () => ({
-  applyRateLimit: (...args: Parameters<typeof import('@/lib/rateLimit').applyRateLimit>) => applyRateLimitMock(...args),
+  applyRateLimit: (
+    ...args: Parameters<typeof import('@/lib/rateLimit').applyRateLimit>
+  ) => applyRateLimitMock(...args),
   getClientIp: vi.fn(() => '127.0.0.1'),
 }));
 
 vi.mock('@/lib/payout/providers/registry', () => ({
   getPayoutProvider: () => ({
-    checkTransferStatus: vi.fn().mockResolvedValue({ reference: 'ref-123', status: 'success' }),
+    checkTransferStatus: vi
+      .fn()
+      .mockResolvedValue({ reference: 'ref-123', status: 'success' }),
   }),
+}));
+
+vi.mock('@/lib/auth/authorizationMatrix', () => ({
+  authorizeTransferAccess: vi.fn(() => ({ authorized: true, isAdmin: false })),
+  uniformNotFoundResponse: vi.fn(
+    () =>
+      new Response(
+        JSON.stringify({ success: false, message: 'Transfer not found' }),
+        {
+          status: 404,
+          headers: { 'content-type': 'application/json' },
+        },
+      ),
+  ),
 }));
 
 const { POST } = await import('./route');

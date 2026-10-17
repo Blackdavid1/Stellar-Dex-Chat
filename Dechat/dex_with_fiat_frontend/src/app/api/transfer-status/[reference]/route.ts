@@ -1,11 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getTransferStatus, setTransferStatus } from '@/lib/transferStore';
+import { setTransferStatus } from '@/lib/transferStore';
 import { applyRateLimit, getClientIp } from '@/lib/rateLimit';
+import {
+  authorizeTransferAccess,
+  uniformNotFoundResponse,
+} from '@/lib/auth/authorizationMatrix';
 
 const RATE_LIMIT = { maxRequests: 5, windowMs: 60_000 };
 
 // Temporary memory store to mark cancellation requests.
-// In a full production app, this would update a database record.
 const cancelledTransfers = new Set<string>();
 
 export async function POST(
@@ -30,25 +33,18 @@ export async function POST(
     const body = await request.json().catch(() => ({}));
     const clientSessionId = body.clientSessionId as string | undefined;
 
-    const existing = getTransferStatus(reference);
-    if (!existing) {
-      return NextResponse.json(
-        { success: false, message: 'Transfer not found' },
-        { status: 404 },
-      );
+    // IDOR check: authorize caller before performing cancellation or returning sensitive data.
+    // Denials return uniform 404 to avoid leaking record existence.
+    const auth = authorizeTransferAccess(request, reference, clientSessionId);
+    if (!auth.authorized || !auth.record) {
+      return uniformNotFoundResponse();
     }
 
+    const existing = auth.record;
     if (existing.status !== 'pending') {
       return NextResponse.json(
         { success: false, message: 'Only pending transfers can be cancelled' },
         { status: 409 },
-      );
-    }
-
-    if (clientSessionId && existing.clientSessionId !== clientSessionId) {
-      return NextResponse.json(
-        { success: false, message: 'Unauthorized' },
-        { status: 403 },
       );
     }
 
@@ -60,6 +56,9 @@ export async function POST(
       updatedAt: new Date().toISOString(),
       clientSessionId: existing?.clientSessionId,
       failureReason: existing?.failureReason,
+      credentialVersion: existing?.credentialVersion,
+      timeoutOutcome: existing?.timeoutOutcome,
+      reconciled: existing?.reconciled,
     });
 
     return NextResponse.json({
@@ -94,33 +93,30 @@ export async function GET(
       );
     }
 
+    // IDOR check: authorize caller before returning transfer status.
+    // Denials return uniform 404 to prevent probing and leaking record existence.
+    const auth = authorizeTransferAccess(request, reference);
+    if (!auth.authorized || !auth.record) {
+      return uniformNotFoundResponse();
+    }
+
+    const transferRecord = auth.record;
+
     if (cancelledTransfers.has(reference)) {
-      const existing = getTransferStatus(reference);
       return NextResponse.json({
         success: true,
         data: {
           reference,
           status: 'cancelled',
-          amount: existing?.amount ?? 0,
+          amount: transferRecord?.amount ?? 0,
           message: 'Transfer cancellation requested successfully',
         },
       });
     }
 
-    const transferRecord = getTransferStatus(reference);
-    if (transferRecord) {
-      return NextResponse.json({
-        success: true,
-        data: transferRecord,
-      });
-    }
-
     return NextResponse.json({
       success: true,
-      data: {
-        reference,
-        status: 'pending',
-      },
+      data: transferRecord,
     });
   } catch (error: unknown) {
     console.error('Get transfer status error:', error);

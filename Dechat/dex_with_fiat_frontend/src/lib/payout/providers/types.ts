@@ -27,12 +27,14 @@ export interface InitiateTransferInput {
   amount: number;
   recipient: string;
   reference?: string;
+  credentialVersion?: string;
 }
 
 export type InitiateTransferResult = Record<string, unknown>;
 
 export interface TransferStatusInput {
   reference: string;
+  credentialVersion?: string;
 }
 
 export type TransferStatusResult = Record<string, unknown>;

@@ -30,6 +30,7 @@ vi.mock('@/lib/rateLimit', () => ({
 
 vi.mock('@/lib/transferStore', () => ({
   setTransferStatus: vi.fn(),
+  getTransferStatus: vi.fn(() => undefined),
 }));
 
 vi.mock('@/lib/payout/providers/registry', () => ({
@@ -44,12 +45,16 @@ vi.mock('@/lib/apiSchemas', () => ({
 
 const { POST } = await import('./route');
 
-function makeRequest(body: unknown) {
+function makeRequest(body: unknown, headers: Record<string, string> = {}) {
   return new NextRequest(
     new Request('http://localhost/api/initiate-transfer', {
       method: 'POST',
       body: JSON.stringify(body),
-      headers: { 'content-type': 'application/json' },
+      headers: {
+        'content-type': 'application/json',
+        'X-Idempotency-Key': 'key-default-123',
+        ...headers,
+      },
     }),
   );
 }
@@ -64,7 +69,10 @@ describe('POST /api/initiate-transfer', () => {
       new Request('http://localhost/api/initiate-transfer', {
         method: 'POST',
         body: 'not json{{{',
-        headers: { 'content-type': 'application/json' },
+        headers: {
+          'content-type': 'application/json',
+          'X-Idempotency-Key': 'key-bad-json',
+        },
       }),
     );
 
@@ -76,8 +84,35 @@ describe('POST /api/initiate-transfer', () => {
     expect(body.message).toContain('Invalid JSON');
   });
 
+  it('returns 400 when X-Idempotency-Key header is missing', async () => {
+    const noKeyReq = new NextRequest(
+      new Request('http://localhost/api/initiate-transfer', {
+        method: 'POST',
+        body: JSON.stringify({
+          source: 'wallet',
+          reason: 'pay',
+          amount: '10',
+          recipient: 'G1',
+        }),
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+
+    const res = await POST(noKeyReq);
+    const body = await res.json();
+
+    expect(res.status).toBe(400);
+    expect(body.success).toBe(false);
+    expect(body.message).toContain('X-Idempotency-Key');
+  });
+
   it('returns 400 for validation failures', async () => {
-    const req = makeRequest({ source: '', reason: '', amount: '', recipient: '' });
+    const req = makeRequest({
+      source: '',
+      reason: '',
+      amount: '',
+      recipient: '',
+    });
     const res = await POST(req);
     const body = await res.json();
 
@@ -86,12 +121,15 @@ describe('POST /api/initiate-transfer', () => {
   });
 
   it('returns 200 for valid request', async () => {
-    const req = makeRequest({
-      source: 'wallet',
-      reason: 'payment',
-      amount: '100',
-      recipient: 'GABC123',
-    });
+    const req = makeRequest(
+      {
+        source: 'wallet',
+        reason: 'payment',
+        amount: '100',
+        recipient: 'GABC123',
+      },
+      { 'X-Idempotency-Key': 'key-valid-unique-1' },
+    );
     const res = await POST(req);
     const body = await res.json();
 

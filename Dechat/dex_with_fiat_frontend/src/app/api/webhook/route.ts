@@ -5,6 +5,7 @@ import { isReplayEvent } from '@/lib/transferStore';
 import { getTransferStatus, setTransferStatus } from '@/lib/transferStore';
 import { serverEnv as env } from '@/lib/serverEnv';
 import { publishPaymentStatus } from '@/lib/paymentStatusEvents';
+import { credentialManager } from '@/lib/payout/credentialManager';
 
 interface PaystackWebhookData {
   id?: string;
@@ -43,7 +44,9 @@ export async function POST(request: NextRequest) {
         success: false,
         error: 'Missing PAYSTACK_SECRET_KEY',
       });
-      console.error('PAYSTACK_SECRET_KEY is not configured. Rejecting webhook.');
+      console.error(
+        'PAYSTACK_SECRET_KEY is not configured. Rejecting webhook.',
+      );
       return NextResponse.json(
         { message: 'Webhook processing is not configured' },
         { status: 400 },
@@ -77,19 +80,36 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Verify signature
+    // Verify signature across active and retiring credentials during bounded rotation overlap (#105)
     telemetry.addLog(span.spanId, 'info', 'Verifying webhook signature', {
       endpoint: '/api/webhook',
     });
 
-    const hash = crypto
-      .createHmac('sha512', secretKey)
-      .update(payload)
-      .digest('hex');
+    const candidateCreds = credentialManager.getAllWebhookCredentials();
+    const candidateKeys: Array<{ version: string; secretKey: string }> = [];
 
-    if (hash !== signature) {
+    for (const cred of candidateCreds) {
+      candidateKeys.push({ version: cred.version, secretKey: cred.secretKey });
+    }
+
+    if (!candidateKeys.some((k) => k.secretKey === secretKey)) {
+      candidateKeys.push({ version: 'v1', secretKey });
+    }
+
+    let matchedVersion: string | null = null;
+    for (const cred of candidateKeys) {
+      const candidateHash = crypto
+        .createHmac('sha512', cred.secretKey)
+        .update(payload)
+        .digest('hex');
+      if (candidateHash === signature) {
+        matchedVersion = cred.version;
+        break;
+      }
+    }
+
+    if (!matchedVersion) {
       telemetry.addLog(span.spanId, 'error', 'Invalid webhook signature', {
-        expectedHash: hash,
         receivedSignature: signature,
       });
       telemetry.finishSpan(span.spanId, {
@@ -104,14 +124,24 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    telemetry.addLog(span.spanId, 'info', 'Webhook signature verified', {
+      endpoint: '/api/webhook',
+      ...credentialManager.logContext(matchedVersion),
+    });
+
     let event: PaystackWebhookEvent;
     try {
       event = JSON.parse(payload) as PaystackWebhookEvent;
     } catch {
-      telemetry.addLog(span.spanId, 'warn', 'Webhook payload is not valid JSON', {
-        endpoint: '/api/webhook',
-        payloadLength: payload.length,
-      });
+      telemetry.addLog(
+        span.spanId,
+        'warn',
+        'Webhook payload is not valid JSON',
+        {
+          endpoint: '/api/webhook',
+          payloadLength: payload.length,
+        },
+      );
       telemetry.finishSpan(span.spanId, {
         success: false,
         error: 'Invalid JSON payload',
@@ -123,16 +153,17 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const _payloadHash = crypto
-      .createHash('sha256')
-      .update(payload)
-      .digest('hex');
     const dataId = event?.data?.id;
     const dataRef = event?.data?.reference;
     if (!dataId && !dataRef) {
-      telemetry.addLog(span.spanId, 'error', 'Missing event data id and reference', {
-        eventType: event.event,
-      });
+      telemetry.addLog(
+        span.spanId,
+        'error',
+        'Missing event data id and reference',
+        {
+          eventType: event.event,
+        },
+      );
       telemetry.finishSpan(span.spanId, {
         success: false,
         error: 'Missing event data id and reference',

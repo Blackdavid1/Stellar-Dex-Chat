@@ -57,6 +57,10 @@ export interface TransferStatusRecord {
   failureReason?: string;
   updatedAt: string;
   clientSessionId?: string;
+  credentialVersion?: string;
+  timeoutOutcome?: 'known' | 'rejected' | 'ambiguous';
+  reconciled?: boolean;
+  lastError?: string;
 }
 
 // Key is the transfer reference
@@ -69,4 +73,16 @@ export function getTransferStatus(reference: string) {
 export function setTransferStatus(record: TransferStatusRecord) {
   transferStore.set(record.reference, record);
   return record;
+}
+
+export function findTransfersBySession(
+  clientSessionId: string,
+): TransferStatusRecord[] {
+  const results: TransferStatusRecord[] = [];
+  for (const record of transferStore.values()) {
+    if (record.clientSessionId === clientSessionId) {
+      results.push(record);
+    }
+  }
+  return results;
 }
