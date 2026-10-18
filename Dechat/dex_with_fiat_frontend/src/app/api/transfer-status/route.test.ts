@@ -1,17 +1,23 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { NextRequest } from 'next/server';
 
-const applyRateLimitMock: any = vi.fn(() => null);
+vi.mock('server-only', () => ({}));
+
 const applyRateLimitMock = vi.fn<(...args: unknown[]) => null>(() => null);
 
 vi.mock('@/lib/rateLimit', () => ({
-  applyRateLimit: (...args: Parameters<typeof import('@/lib/rateLimit').applyRateLimit>) => applyRateLimitMock(...args),
+  applyRateLimit: (
+    ...args: Parameters<typeof import('@/lib/rateLimit').applyRateLimit>
+  ) => applyRateLimitMock(...args),
   getClientIp: vi.fn(() => '127.0.0.1'),
 }));
 
 vi.mock('@/lib/payout/providers/registry', () => ({
   getPayoutProvider: () => ({
-    checkTransferStatus: vi.fn().mockResolvedValue({ reference: 'ref-123', status: 'success' }),
+    name: 'paystack',
+    checkTransferStatus: vi
+      .fn()
+      .mockResolvedValue({ reference: 'ref-123', status: 'success' }),
   }),
 }));
 

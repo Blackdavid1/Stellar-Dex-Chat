@@ -5,13 +5,32 @@ import { telemetry } from '@/lib/telemetry';
 import { applyRateLimit, getClientIp } from '@/lib/rateLimit';
 import { setTransferStatus } from '@/lib/transferStore';
 import { initiateTransferSchema } from '@/lib/apiSchemas';
+import { enforcePayoutRouteSecurity } from '@/lib/payout/security';
+import {
+  getProviderCircuitBreaker,
+  handlePayoutApiError,
+} from '@/lib/payout/circuitBreaker';
 
 const RATE_LIMIT = { maxRequests: 3, windowMs: 60_000 };
 
-const idempotencyCache = new Map<string, { result: unknown; timestamp: number }>();
+const idempotencyCache = new Map<
+  string,
+  { result: unknown; timestamp: number }
+>();
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
 
+export async function OPTIONS(request: NextRequest) {
+  return (
+    enforcePayoutRouteSecurity(request) ||
+    new NextResponse(null, { status: 204 })
+  );
+}
+
 export async function POST(request: NextRequest) {
+  // Enforce payout API security
+  const securityBlocked = enforcePayoutRouteSecurity(request);
+  if (securityBlocked) return securityBlocked;
+
   const ip = getClientIp(request);
   const limited = applyRateLimit(ip, '/api/initiate-transfer', RATE_LIMIT);
   if (limited) return limited;
@@ -79,9 +98,6 @@ export async function POST(request: NextRequest) {
     }
 
     const { source, reason, amount, recipient } = validationResult.data;
-    // `clientSessionId` isn't part of initiateTransferSchema, so it's read
-    // from the raw (already-validated-as-an-object) body instead of
-    // validationResult.data.
     const bodyRecord = body as Record<string, unknown>;
     const clientSessionId =
       typeof bodyRecord.clientSessionId === 'string'
@@ -96,13 +112,17 @@ export async function POST(request: NextRequest) {
     });
 
     const provider = getPayoutProvider();
-    const data = await provider.initiateTransfer({
-      source,
-      reason,
-      amount,
-      recipient,
-      reference: idempotencyKey,
-    });
+    const breaker = getProviderCircuitBreaker(provider.name);
+
+    const data = await breaker.execute(() =>
+      provider.initiateTransfer({
+        source,
+        reason,
+        amount,
+        recipient,
+        reference: idempotencyKey,
+      }),
+    );
 
     const transferReference =
       typeof data.reference === 'string' && data.reference
@@ -110,16 +130,21 @@ export async function POST(request: NextRequest) {
         : idempotencyKey;
 
     if (transferReference) {
+      const now = Date.now();
       setTransferStatus({
         reference: transferReference,
         status: 'pending',
         amount: Number(amount),
-        updatedAt: new Date().toISOString(),
+        updatedAt: new Date(now).toISOString(),
+        updatedAtMs: now,
         clientSessionId,
       });
     }
 
-    idempotencyCache.set(idempotencyKey, { result: data, timestamp: Date.now() });
+    idempotencyCache.set(idempotencyKey, {
+      result: data,
+      timestamp: Date.now(),
+    });
 
     return NextResponse.json({
       success: true,
@@ -150,18 +175,19 @@ export async function POST(request: NextRequest) {
 
     console.error('Initiate transfer error:', error);
 
+    const errorDetails = handlePayoutApiError(
+      error,
+      'Failed to initiate transfer. Please try again.',
+    );
+
     telemetry.finishSpan(span.spanId, {
       success: false,
-      error: 'Failed to initiate transfer. Please try again.',
-      errorType: 'unknown_error',
+      error: errorDetails.body.message,
     });
 
-    return NextResponse.json(
-      {
-        success: false,
-        message: 'Failed to initiate transfer. Please try again.',
-      },
-      { status: 500 },
-    );
+    return NextResponse.json(errorDetails.body, {
+      status: errorDetails.status,
+      headers: errorDetails.headers,
+    });
   }
 }

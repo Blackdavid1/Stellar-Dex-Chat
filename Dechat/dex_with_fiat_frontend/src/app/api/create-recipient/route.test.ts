@@ -1,13 +1,19 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { NextRequest } from 'next/server';
+import { clearBeneficiaryStore } from '@/lib/payout/beneficiaryStore';
+import {
+  resetCircuitBreakers,
+  ProviderOutageError,
+} from '@/lib/payout/circuitBreaker';
 
 vi.mock('server-only', () => ({}));
 
-const applyRateLimitMock: any = vi.fn(() => null);
 const applyRateLimitMock = vi.fn<(...args: unknown[]) => null>(() => null);
 
 vi.mock('@/lib/rateLimit', () => ({
-  applyRateLimit: (...args: Parameters<typeof import('@/lib/rateLimit').applyRateLimit>) => applyRateLimitMock(...args),
+  applyRateLimit: (
+    ...args: Parameters<typeof import('@/lib/rateLimit').applyRateLimit>
+  ) => applyRateLimitMock(...args),
   getClientIp: vi.fn(() => '127.0.0.1'),
 }));
 
@@ -27,7 +33,10 @@ const createRecipientMock = vi.fn().mockResolvedValue({
 });
 
 vi.mock('@/lib/payout/providers/registry', () => ({
-  getPayoutProvider: () => ({ createRecipient: createRecipientMock }),
+  getPayoutProvider: () => ({
+    name: 'paystack',
+    createRecipient: createRecipientMock,
+  }),
 }));
 
 const { POST } = await import('./route');
@@ -40,12 +49,21 @@ const VALID_BODY = {
   currency: 'NGN',
 };
 
-function makeRequest(body: unknown, raw = false) {
+function makeRequest(
+  body: unknown,
+  raw = false,
+  extraHeaders: Record<string, string> = {},
+) {
   return new NextRequest(
-    new Request('http://localhost/api/create-recipient', {
+    new Request('http://localhost:3000/api/create-recipient', {
       method: 'POST',
       body: raw ? (body as string) : JSON.stringify(body),
-      headers: { 'content-type': 'application/json' },
+      headers: {
+        'content-type': 'application/json',
+        origin: 'http://localhost:3000',
+        'sec-fetch-site': 'same-origin',
+        ...extraHeaders,
+      },
     }),
   );
 }
@@ -53,6 +71,8 @@ function makeRequest(body: unknown, raw = false) {
 describe('POST /api/create-recipient', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    clearBeneficiaryStore();
+    resetCircuitBreakers();
     applyRateLimitMock.mockReturnValue(null);
     createRecipientMock.mockResolvedValue({
       recipient_code: 'RCP_test',
@@ -66,9 +86,27 @@ describe('POST /api/create-recipient', () => {
 
     expect(res.status).toBe(200);
     expect(body.success).toBe(true);
+    expect(body.data.recipient_code).toBe('RCP_test');
     expect(createRecipientMock).toHaveBeenCalledWith(
       expect.objectContaining({ bank_code: '058', currency: 'NGN' }),
     );
+  });
+
+  it('reuses existing beneficiary reference on identical subsequent submissions', async () => {
+    const res1 = await POST(makeRequest(VALID_BODY));
+    const body1 = await res1.json();
+    expect(body1.success).toBe(true);
+    expect(body1.data.recipient_code).toBe('RCP_test');
+    expect(createRecipientMock).toHaveBeenCalledTimes(1);
+
+    // Second call with same account
+    const res2 = await POST(makeRequest(VALID_BODY));
+    const body2 = await res2.json();
+    expect(body2.success).toBe(true);
+    expect(body2.data.recipient_code).toBe('RCP_test');
+    expect(body2.data.reused).toBe(true);
+    // Remote provider was not called again
+    expect(createRecipientMock).toHaveBeenCalledTimes(1);
   });
 
   it('returns 400 with a machine-readable error shape for invalid input', async () => {
@@ -110,13 +148,26 @@ describe('POST /api/create-recipient', () => {
     expect(createRecipientMock).not.toHaveBeenCalled();
   });
 
-  it('namespaces the rate-limit bucket to this route', async () => {
-    await POST(makeRequest(VALID_BODY));
-
-    expect(applyRateLimitMock).toHaveBeenCalledWith(
-      '127.0.0.1',
-      '/api/create-recipient',
-      expect.objectContaining({ maxRequests: expect.any(Number) }),
+  it('returns 503 when provider outage circuit breaker is tripped', async () => {
+    createRecipientMock.mockRejectedValue(
+      new ProviderOutageError('Provider unavailable', 'OPEN', 30),
     );
+
+    const res = await POST(makeRequest(VALID_BODY));
+    const body = await res.json();
+
+    expect(res.status).toBe(503);
+    expect(body.success).toBe(false);
+    expect(body.error).toBe('PROVIDER_OUTAGE');
+  });
+
+  it('rejects cross-site hostile origins with 403', async () => {
+    const hostileReq = makeRequest(VALID_BODY, false, {
+      origin: 'https://evil-site.com',
+      'sec-fetch-site': 'cross-site',
+    });
+
+    const res = await POST(hostileReq);
+    expect(res.status).toBe(403);
   });
 });

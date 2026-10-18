@@ -2,6 +2,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { NextRequest } from 'next/server';
 import { z } from 'zod';
 
+vi.mock('server-only', () => ({}));
+
 const mockSchema = z.object({
   source: z.string().min(1),
   reason: z.string().min(1),
@@ -34,6 +36,7 @@ vi.mock('@/lib/transferStore', () => ({
 
 vi.mock('@/lib/payout/providers/registry', () => ({
   getPayoutProvider: () => ({
+    name: 'paystack',
     initiateTransfer: vi.fn().mockResolvedValue({ reference: 'ref-123' }),
   }),
 }));
@@ -44,12 +47,16 @@ vi.mock('@/lib/apiSchemas', () => ({
 
 const { POST } = await import('./route');
 
-function makeRequest(body: unknown) {
+function makeRequest(body: unknown, extraHeaders: Record<string, string> = {}) {
   return new NextRequest(
     new Request('http://localhost/api/initiate-transfer', {
       method: 'POST',
       body: JSON.stringify(body),
-      headers: { 'content-type': 'application/json' },
+      headers: {
+        'content-type': 'application/json',
+        'x-idempotency-key': 'test-idempotency-key',
+        ...extraHeaders,
+      },
     }),
   );
 }
@@ -64,7 +71,10 @@ describe('POST /api/initiate-transfer', () => {
       new Request('http://localhost/api/initiate-transfer', {
         method: 'POST',
         body: 'not json{{{',
-        headers: { 'content-type': 'application/json' },
+        headers: {
+          'content-type': 'application/json',
+          'x-idempotency-key': 'test-idempotency-key',
+        },
       }),
     );
 
@@ -77,7 +87,12 @@ describe('POST /api/initiate-transfer', () => {
   });
 
   it('returns 400 for validation failures', async () => {
-    const req = makeRequest({ source: '', reason: '', amount: '', recipient: '' });
+    const req = makeRequest({
+      source: '',
+      reason: '',
+      amount: '',
+      recipient: '',
+    });
     const res = await POST(req);
     const body = await res.json();
 
