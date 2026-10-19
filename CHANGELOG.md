@@ -429,6 +429,7 @@ Repo Avatar
 - **frontend:** Add CSP and security headers in next.config.ts
 - **contract:** Include caller and ledger in deposit, withdraw, set_limit, set_operator events
 - **frontend:** Add dynamic theme tokens to NotificationsCenter.tsx
+- **frontend:** Implement transfer timeline, cross-tab payout coordination, session recovery, and resilient RPC
 - **api:** Circuit breaker, race-safe recipients, reconciliation, and security hardening (#47, #48, #49, #50)
 - **contract:** Add explicit cancellation/refund lifecycle for pending withdrawals
 - **api:** Durable webhook deduplication, out-of-order reconciliation, retry queue, and append-only audit ledger (#35, #36, #37, #38)
@@ -1229,6 +1230,7 @@ Repo Avatar
 - **contract:** Add stateful property-based escrow solvency harness
 - **changelog:** Update changelog [skip ci]
 - **deps:** Bump proptest
+- **changelog:** Update changelog [skip ci]
 - **changelog:** Update changelog [skip ci]
 - **changelog:** Update changelog [skip ci]
 
