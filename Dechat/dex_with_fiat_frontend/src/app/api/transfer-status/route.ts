@@ -51,6 +51,19 @@ export async function POST(request: NextRequest) {
     }
 
     const { reference } = validationResult.data;
+    const bodyRecord = body as Record<string, unknown>;
+    const clientSessionId =
+      request.headers.get('x-client-session-id') ||
+      (typeof bodyRecord.clientSessionId === 'string'
+        ? bodyRecord.clientSessionId
+        : undefined);
+
+    // IDOR check: verify caller is authorized for this reference.
+    // If unauthorized, return 404 immediately without calling the provider!
+    const auth = authorizeTransferAccess(request, reference, clientSessionId);
+    if (!auth.authorized) {
+      return uniformNotFoundResponse();
+    }
 
     const provider = getPayoutProvider();
     const breaker = getProviderCircuitBreaker(provider.name);

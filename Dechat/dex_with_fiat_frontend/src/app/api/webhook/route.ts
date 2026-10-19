@@ -81,19 +81,36 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Verify signature
+    // Verify signature across active and retiring credentials during bounded rotation overlap (#105)
     telemetry.addLog(span.spanId, 'info', 'Verifying webhook signature', {
       endpoint: '/api/webhook',
     });
 
-    const hash = crypto
-      .createHmac('sha512', secretKey)
-      .update(payload)
-      .digest('hex');
+    const candidateCreds = credentialManager.getAllWebhookCredentials();
+    const candidateKeys: Array<{ version: string; secretKey: string }> = [];
 
-    if (hash !== signature) {
+    for (const cred of candidateCreds) {
+      candidateKeys.push({ version: cred.version, secretKey: cred.secretKey });
+    }
+
+    if (!candidateKeys.some((k) => k.secretKey === secretKey)) {
+      candidateKeys.push({ version: 'v1', secretKey });
+    }
+
+    let matchedVersion: string | null = null;
+    for (const cred of candidateKeys) {
+      const candidateHash = crypto
+        .createHmac('sha512', cred.secretKey)
+        .update(payload)
+        .digest('hex');
+      if (candidateHash === signature) {
+        matchedVersion = cred.version;
+        break;
+      }
+    }
+
+    if (!matchedVersion) {
       telemetry.addLog(span.spanId, 'error', 'Invalid webhook signature', {
-        expectedHash: hash,
         receivedSignature: signature,
       });
       telemetry.finishSpan(span.spanId, {
@@ -107,6 +124,11 @@ export async function POST(request: NextRequest) {
         { status: 401 },
       );
     }
+
+    telemetry.addLog(span.spanId, 'info', 'Webhook signature verified', {
+      endpoint: '/api/webhook',
+      ...credentialManager.logContext(matchedVersion),
+    });
 
     let event: PaystackWebhookEvent;
     try {

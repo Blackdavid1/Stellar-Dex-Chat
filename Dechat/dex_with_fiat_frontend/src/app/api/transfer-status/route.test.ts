@@ -21,6 +21,20 @@ vi.mock('@/lib/payout/providers/registry', () => ({
   }),
 }));
 
+vi.mock('@/lib/auth/authorizationMatrix', () => ({
+  authorizeTransferAccess: vi.fn(() => ({ authorized: true, isAdmin: false })),
+  uniformNotFoundResponse: vi.fn(
+    () =>
+      new Response(
+        JSON.stringify({ success: false, message: 'Transfer not found' }),
+        {
+          status: 404,
+          headers: { 'content-type': 'application/json' },
+        },
+      ),
+  ),
+}));
+
 const { POST } = await import('./route');
 
 function makeRequest(body: unknown) {

@@ -2,9 +2,16 @@ import { NextRequest, NextResponse } from 'next/server';
 import crypto from 'crypto';
 import * as Sentry from '@sentry/nextjs';
 import { getPayoutProvider } from '@/lib/payout/providers/registry';
+import { credentialManager } from '@/lib/payout/credentialManager';
+import {
+  AmbiguousInitiationError,
+  ProviderTimeoutError,
+  sanitizeProviderError,
+} from '@/lib/payout/timeoutBudget';
+import { reconcileAmbiguousInitiation } from '@/lib/payout/reconciliation';
 import { telemetry } from '@/lib/telemetry';
 import { applyRateLimit, getClientIp } from '@/lib/rateLimit';
-import { setTransferStatus } from '@/lib/transferStore';
+import { setTransferStatus, getTransferStatus } from '@/lib/transferStore';
 import { initiateTransferSchema } from '@/lib/apiSchemas';
 import { payoutAuditLedger } from '@/lib/payout/auditLedger';
 import { payoutRetryQueue } from '@/lib/payout/retryQueue';
@@ -85,9 +92,13 @@ export async function POST(request: NextRequest) {
     const { source, reason, amount, recipient } = validationResult.data;
     const bodyRecord = body as Record<string, unknown>;
     const clientSessionId =
-      typeof bodyRecord.clientSessionId === 'string'
+      request.headers.get('x-client-session-id') ||
+      (typeof bodyRecord.clientSessionId === 'string'
         ? bodyRecord.clientSessionId
-        : undefined;
+        : undefined);
+
+    const activeCred = credentialManager.getActiveCredential();
+    const credentialVersion = activeCred?.version || 'v1';
 
     // Idempotency key from header, body reference, or generated fallback
     const headerIdempotencyKey = request.headers.get('X-Idempotency-Key');
@@ -236,14 +247,13 @@ export async function POST(request: NextRequest) {
       },
     });
 
-    const errorMessage =
-      error instanceof Error ? error.message : 'Unknown error';
+    const sanitized = sanitizeProviderError(error, 'initiate', idempotencyKey);
 
     telemetry.addLog(
       span.spanId,
       'error',
       'Unhandled error in transfer initiation',
-      { error: errorMessage },
+      { error: sanitized.message, code: sanitized.code },
     );
 
     console.error('Initiate transfer error:', error);

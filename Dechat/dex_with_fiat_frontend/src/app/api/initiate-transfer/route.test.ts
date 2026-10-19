@@ -34,6 +34,7 @@ vi.mock('@/lib/rateLimit', () => ({
 
 vi.mock('@/lib/transferStore', () => ({
   setTransferStatus: vi.fn(),
+  getTransferStatus: vi.fn(() => undefined),
 }));
 
 const mockInitiateTransfer = vi
@@ -92,6 +93,28 @@ describe('POST /api/initiate-transfer', () => {
     expect(res.status).toBe(400);
     expect(body.success).toBe(false);
     expect(body.message).toContain('Invalid JSON');
+  });
+
+  it('returns 400 when X-Idempotency-Key header is missing', async () => {
+    const noKeyReq = new NextRequest(
+      new Request('http://localhost/api/initiate-transfer', {
+        method: 'POST',
+        body: JSON.stringify({
+          source: 'wallet',
+          reason: 'pay',
+          amount: '10',
+          recipient: 'G1',
+        }),
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+
+    const res = await POST(noKeyReq);
+    const body = await res.json();
+
+    expect(res.status).toBe(400);
+    expect(body.success).toBe(false);
+    expect(body.message).toContain('X-Idempotency-Key');
   });
 
   it('returns 400 for validation failures', async () => {
