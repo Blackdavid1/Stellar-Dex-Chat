@@ -22,7 +22,7 @@
 use crate::{Error, FiatBridge, FiatBridgeClient};
 use proptest::prelude::*;
 use soroban_sdk::{
-    testutils::{Address as _, Events as _},
+    testutils::{Address as _, Events as _, Ledger as _},
     token, Address, Bytes, Env, Vec,
 };
 
@@ -271,6 +271,101 @@ fn withdraw_emits_event_with_caller_and_ledger() {
 
     let events = env.events().all().filter_by_contract(&contract_id);
     assert!(!events.events().is_empty());
+}
+
+/// Withdrawals whose fiat value sits exactly on the configured limit are
+/// accepted, while one unit above the limit is rejected. The conversion is
+/// performed by the contract's centralized fixed-point helper, which rounds
+/// the fiat value down (towards zero) before comparing against the limit.
+#[test]
+fn withdraw_at_fiat_limit_boundary_is_consistent_with_rounding() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (contract_id, bridge, admin, token_addr, token_client, token_admin) = setup_bridge(&env);
+    seed_deposit(&env, &bridge, &token_addr, &token_admin, 5_000);
+
+    let limit = bridge.get_withdraw_limit();
+    let balance_before = token_client.balance(&contract_id);
+
+    // Exactly at the limit: accepted.
+    let recipient = Address::generate(&env);
+    bridge.withdraw(&admin, &recipient, &limit, &token_addr);
+    assert_eq!(token_client.balance(&recipient), limit);
+    assert_eq!(bridge.get_total_withdrawn(), limit);
+
+    // One unit above the limit: rejected without mutating accounting.
+    let withdrawn_before = bridge.get_total_withdrawn();
+    let balance_before_reject = token_client.balance(&contract_id);
+    let recipient2 = Address::generate(&env);
+    let result = bridge.try_withdraw(&admin, &recipient2, &(limit + 1), &token_addr);
+    assert_eq!(result, Err(Ok(Error::WithdrawLimitExceeded)));
+    assert_eq!(token_client.balance(&contract_id), balance_before_reject);
+    assert_eq!(bridge.get_total_withdrawn(), withdrawn_before);
+    assert_eq!(token_client.balance(&recipient2), 0);
+
+    // One unit below the limit: accepted.
+    let recipient3 = Address::generate(&env);
+    bridge.withdraw(&admin, &recipient3, &(limit - 1), &token_addr);
+    assert_eq!(token_client.balance(&recipient3), limit - 1);
+
+    let total_deposited = bridge.get_total_deposited();
+    let total_withdrawn = bridge.get_total_withdrawn();
+    let total_liabilities = bridge.get_total_liabilities();
+    let balance = token_client.balance(&contract_id);
+    assert!(balance <= balance_before);
+    invariants_hold(total_deposited, total_withdrawn, total_liabilities, balance);
+}
+
+/// A stale oracle observation must abort the withdrawal before any accounting
+/// or token movement occurs.
+#[test]
+fn withdraw_rejects_stale_oracle_observation_without_state_change() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (contract_id, bridge, admin, token_addr, token_client, token_admin) = setup_bridge(&env);
+    seed_deposit(&env, &bridge, &token_addr, &token_admin, 5_000);
+
+    let balance_before = token_client.balance(&contract_id);
+    let withdrawn_before = bridge.get_total_withdrawn();
+
+    // Advance the ledger far beyond the configured maximum observation age.
+    let max_age = bridge.get_max_oracle_age();
+    env.ledger().set_sequence_number(max_age.saturating_add(1));
+
+    let recipient = Address::generate(&env);
+    let result = bridge.try_withdraw(&admin, &recipient, &500, &token_addr);
+    assert_eq!(result, Err(Ok(Error::StaleOracleObservation)));
+
+    assert_eq!(token_client.balance(&contract_id), balance_before);
+    assert_eq!(bridge.get_total_withdrawn(), withdrawn_before);
+    assert_eq!(token_client.balance(&recipient), 0);
+}
+
+/// An oracle observation below the configured confidence threshold must be
+/// rejected without mutating withdrawal accounting.
+#[test]
+fn withdraw_rejects_low_confidence_oracle_observation_without_state_change() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (contract_id, bridge, admin, token_addr, token_client, token_admin) = setup_bridge(&env);
+    seed_deposit(&env, &bridge, &token_addr, &token_admin, 5_000);
+
+    let balance_before = token_client.balance(&contract_id);
+    let withdrawn_before = bridge.get_total_withdrawn();
+
+    let threshold = bridge.get_min_oracle_confidence();
+    bridge.set_oracle_confidence(&threshold.saturating_sub(1));
+
+    let recipient = Address::generate(&env);
+    let result = bridge.try_withdraw(&admin, &recipient, &500, &token_addr);
+    assert_eq!(result, Err(Ok(Error::OracleConfidenceTooLow)));
+
+    assert_eq!(token_client.balance(&contract_id), balance_before);
+    assert_eq!(bridge.get_total_withdrawn(), withdrawn_before);
+    assert_eq!(token_client.balance(&recipient), 0);
 }
 
 #[test]

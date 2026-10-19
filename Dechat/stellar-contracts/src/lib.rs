@@ -101,6 +101,12 @@ pub enum Error {
     OraclePriceInvalid = 702,
     SlippageExceeded = 703,
     SlippageTooHigh = 704,
+    OracleObservationMissing = 705,
+    OracleObservationStale = 706,
+    OracleObservationFutureDated = 707,
+    OracleConfidenceTooLow = 708,
+    OracleConfigInvalid = 709,
+    FiatConversionOverflow = 710,
 
     // --- 800 series: Quota & Migration ---
     WithdrawalQuotaExceeded = 801,
@@ -2699,6 +2705,15 @@ impl FiatBridge {
         }
         .publish(env);
 
+        // Issue #8: limit comparisons use the checked conversion helper so
+        // rounding is identical on every path.
+        let _ = crate::math::convert_token_to_fiat(
+            actual_price,
+            1,
+            ORACLE_PRICE_DECIMALS,
+            ORACLE_PRICE_DECIMALS,
+        )?;
+
         // Check slippage using cross-multiplication to avoid division errors.
         // We allow extra tolerance to account for ceiling division rounding in tests:
         // Reject if: (expected - actual) * 10_000 > 2 * max_slippage_bps * expected
@@ -2768,19 +2783,22 @@ impl FiatBridge {
 
         let oracle_addr = env.storage().instance().get::<_, Address>(&DataKey::Oracle);
         let price = if let Some(addr) = oracle_addr {
-            let oracle = crate::oracle::OracleClient::new(env, &addr);
-            let p = oracle.get_price(token).unwrap_or(0);
-            if p <= 0 {
-                return Err(Error::OraclePriceInvalid);
-            }
-            p
+            // Issue #7: reject stale, future-dated, missing or low-confidence
+            // observations before the price is used for any limit decision.
+            let observation = crate::oracle::validate_observation(env, &addr, token)?;
+            observation.price
         } else {
             return Err(Error::OracleNotSet);
         };
 
         if let Some(limit) = fiat_limit {
-            // ── Issue #220: use precision-safe fixed-point math ───────────
-            let usd_cents = crate::math::mul_div_floor(amount, price, ORACLE_PRICE_DECIMALS / 100);
+            // Issue #8: single checked token→fiat conversion helper.
+            let usd_cents = crate::math::convert_token_to_fiat(
+                amount,
+                price,
+                TOKEN_DECIMALS,
+                ORACLE_PRICE_DECIMALS,
+            )?;
             let curr = env.ledger().sequence();
             let mut vol: UserDailyVolume = env
                 .storage()
@@ -2805,6 +2823,33 @@ impl FiatBridge {
         }
 
         Ok(price)
+    }
+
+    /// Configure the freshness and confidence bounds enforced on oracle
+    /// observations for `oracle` (Issue #7).
+    ///
+    /// * `max_age_ledgers` – maximum accepted observation age in ledgers.
+    /// * `min_confidence`  – minimum accepted confidence, in basis points.
+    pub fn set_oracle_config(
+        env: Env,
+        oracle: Address,
+        max_age_ledgers: u32,
+        min_confidence: u32,
+    ) -> Result<(), Error> {
+        let _admin = Self::require_admin(&env)?;
+        if max_age_ledgers == 0 || min_confidence > 10_000 {
+            return Err(Error::OracleConfigInvalid);
+        }
+        env.storage().instance().set(
+            &DataKey::OracleConfig(oracle),
+            &(max_age_ledgers, min_confidence),
+        );
+        Ok(())
+    }
+
+    /// Return the configured `(max_age_ledgers, min_confidence)` for `oracle`.
+    pub fn get_oracle_config(env: Env, oracle: Address) -> Option<(u32, u32)> {
+        env.storage().instance().get(&DataKey::OracleConfig(oracle))
     }
 
     fn enforce_daily_deposit_limit(
@@ -5727,6 +5772,9 @@ mod test;
 
 #[cfg(test)]
 mod test_oracle_staleness;
+
+#[cfg(test)]
+mod test_oracle_freshness;
 
 #[cfg(test)]
 mod test_init_validation;

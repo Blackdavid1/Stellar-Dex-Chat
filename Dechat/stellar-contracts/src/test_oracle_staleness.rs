@@ -8,6 +8,8 @@
 extern crate std;
 
 use crate::oracle::TimestampedPrice;
+use crate::oracle::{OracleError, OracleObservation};
+use soroban_sdk::{testutils::Events as _, Env, Symbol};
 
 // ---------------------------------------------------------------------------
 // Helper
@@ -140,4 +142,102 @@ fn test_future_recorded_at_saturates_to_zero_age() {
         check(recorded_at, current, max_age),
         "recorded_at > current_ledger should saturate age to 0 (fresh)"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #7: observation validation — distinct errors per invalid class
+// ---------------------------------------------------------------------------
+
+/// Build a well-formed observation used as the baseline for the failure tests.
+fn observation(env: &Env, recorded_at: u32, confidence_bps: u32) -> OracleObservation {
+    OracleObservation {
+        oracle: Symbol::new(env, "chainlink"),
+        price: 10_000_000,
+        recorded_at,
+        confidence_bps,
+    }
+}
+
+/// Boundary: an observation whose age equals `max_age_ledgers` is accepted,
+/// and one ledger older is rejected with `StaleObservation`.
+#[test]
+fn test_observation_age_boundary() {
+    let env = Env::default();
+    let max_age = 100u32;
+    let min_conf = 500u32;
+    let current = 1_000u32;
+
+    let at_boundary = observation(&env, current - max_age, 900);
+    assert_eq!(
+        at_boundary.validate(&env, current, max_age, min_conf),
+        Ok(())
+    );
+
+    let past_boundary = observation(&env, current - max_age - 1, 900);
+    assert_eq!(
+        past_boundary.validate(&env, current, max_age, min_conf),
+        Err(OracleError::StaleObservation)
+    );
+}
+
+/// Boundary: confidence exactly at the threshold is accepted; one basis point
+/// below is rejected with `LowConfidence`.
+#[test]
+fn test_observation_confidence_boundary() {
+    let env = Env::default();
+    let max_age = 100u32;
+    let min_conf = 500u32;
+    let current = 1_000u32;
+
+    let at_boundary = observation(&env, current, min_conf);
+    assert_eq!(
+        at_boundary.validate(&env, current, max_age, min_conf),
+        Ok(())
+    );
+
+    let below_boundary = observation(&env, current, min_conf - 1);
+    assert_eq!(
+        below_boundary.validate(&env, current, max_age, min_conf),
+        Err(OracleError::LowConfidence)
+    );
+}
+
+/// A future-dated observation is rejected with `FutureObservation` rather than
+/// being silently treated as fresh.
+#[test]
+fn test_observation_future_dated_rejected() {
+    let env = Env::default();
+    let current = 1_000u32;
+    let future = observation(&env, current + 1, 900);
+    assert_eq!(
+        future.validate(&env, current, 100, 500),
+        Err(OracleError::FutureObservation)
+    );
+}
+
+/// A missing observation is rejected with `MissingObservation`.
+#[test]
+fn test_observation_missing_rejected() {
+    let env = Env::default();
+    let missing: Option<OracleObservation> = None;
+    assert_eq!(
+        OracleObservation::validate_optional(&env, &missing, 1_000, 100, 500),
+        Err(OracleError::MissingObservation)
+    );
+}
+
+/// Diagnostic events carry only oracle identity and ledger/time — never the
+/// untrusted price payload.
+#[test]
+fn test_observation_diagnostic_event_has_no_payload() {
+    let env = Env::default();
+    let current = 1_000u32;
+    let obs = observation(&env, current - 5, 900);
+    obs.validate(&env, current, 100, 500).unwrap();
+
+    let events = env.events().all();
+    let last = events.last().expect("diagnostic event must be emitted");
+    let (_, topics, data) = last;
+    assert_eq!(topics.len(), 2);
+    assert_eq!(data, (current, obs.recorded_at));
 }
