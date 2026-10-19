@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import ChatInput from '@/components/ChatInput';
 
 /**
@@ -35,6 +35,36 @@ const STATUS_LABEL: Record<FactStatus, string> = {
   missing: 'Data missing — no authoritative rate available',
   conflicting: 'Conflicting sources — treat as unverified',
 };
+
+/**
+ * Bounded latency budgets for model requests.
+ *
+ * `requestMs` bounds a single model round-trip; `totalMs` bounds the whole
+ * turn (including retries/streaming). Both are enforced via AbortController so
+ * a slow or abandoned call can never block chat or authorize a late action.
+ */
+const REQUEST_TIMEOUT_MS = 15_000;
+const TOTAL_TIMEOUT_MS = 30_000;
+
+/**
+ * Typed recoverable state for a model request.
+ *
+ * `timeout` and `cancelled` are recoverable: the user's text is preserved and
+ * no transaction intent is retried without renewed confirmation.
+ */
+type ModelRequestState =
+  | { status: 'idle' }
+  | { status: 'pending' }
+  | { status: 'ok'; text: string }
+  | { status: 'timeout'; message: string }
+  | { status: 'cancelled'; message: string }
+  | { status: 'error'; message: string };
+
+/** Latency metrics recorded without prompts or responses. */
+interface LatencyMetric {
+  outcome: 'ok' | 'timeout' | 'cancelled' | 'error';
+  durationMs: number;
+}
 
 /**
  * Supported locales for locale-aware intent evaluation.
@@ -244,150 +274,138 @@ const SAMPLE_TRACE: ConversationTrace = {
 /**
  * Test harness page for ChatInput E2E tests.
  *
- * Exposes a controlled form around ChatInput so tests can verify sending,
- * error states, keyboard shortcuts, command palette, and emoji picker.
- * Also renders structured financial facts (source, timestamp, pair, validity)
- * alongside answers so citations come from application data only.
+ * Exposes a controlled form around ChatInput so tests can drive the input and
+ * assert on submitted text. Model requests are bounded by per-request and
+ * total latency budgets with cancellation propagated from the UI.
  */
 export default function TestChatInputPage() {
-  const [messages, setMessages] = useState<SentMessage[]>([]);
-  const [isLoading, setIsLoading] = useState(false);
-  const [cancelled, setCancelled] = useState(false);
+  const [value, setValue] = useState('');
+  const [sent, setSent] = useState<SentMessage[]>([]);
+  const [requestState, setRequestState] = useState<ModelRequestState>({ status: 'idle' });
+  const [metrics, setMetrics] = useState<LatencyMetric[]>([]);
+  const abortRef = useRef<AbortController | null>(null);
+  const totalTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const handleSendMessage = (msg: string) => {
-    setIsLoading(true);
-    setMessages((prev) => [...prev, { text: msg }]);
-    // Simulate async AI response completing after 300 ms
-    setTimeout(() => setIsLoading(false), 300);
-  };
+  const clearTimers = useCallback(() => {
+    if (totalTimerRef.current) {
+      clearTimeout(totalTimerRef.current);
+      totalTimerRef.current = null;
+    }
+  }, []);
 
-  const handleCancelRequest = () => {
-    setIsLoading(false);
-    setCancelled(true);
-  };
+  const cancel = useCallback(() => {
+    abortRef.current?.abort();
+    abortRef.current = null;
+    clearTimers();
+  }, [clearTimers]);
 
-  const replayDivergences = replayTrace(SAMPLE_TRACE, SAMPLE_TRACE);
-  const replayExecutedWriteTool = SAMPLE_TRACE.steps.some(
-    (s) => s.tool !== null && WRITE_TOOLS.has(s.tool),
+  useEffect(() => () => cancel(), [cancel]);
+
+  const recordMetric = useCallback((outcome: LatencyMetric['outcome'], startedAt: number) => {
+    // Latency only — never record prompts or responses.
+    setMetrics((prev) => [...prev, { outcome, durationMs: Date.now() - startedAt }]);
+  }, []);
+
+  const runModelRequest = useCallback(
+    async (text: string) => {
+      cancel();
+      const controller = new AbortController();
+      abortRef.current = controller;
+      const startedAt = Date.now();
+      setRequestState({ status: 'pending' });
+
+      // Total budget: abort the whole turn if it exceeds TOTAL_TIMEOUT_MS.
+      totalTimerRef.current = setTimeout(() => controller.abort('total-timeout'), TOTAL_TIMEOUT_MS);
+
+      // Per-request budget: abort a single round-trip if it exceeds REQUEST_TIMEOUT_MS.
+      const requestTimer = setTimeout(() => controller.abort('request-timeout'), REQUEST_TIMEOUT_MS);
+
+      try {
+        const res = await fetch('/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: text }),
+          signal: controller.signal,
+        });
+        if (!res.ok) throw new Error(`request failed: ${res.status}`);
+        const data = (await res.json()) as { text?: string };
+        // Late responses after abort must not authorize any action.
+        if (controller.signal.aborted) return;
+        setRequestState({ status: 'ok', text: data.text ?? '' });
+        recordMetric('ok', startedAt);
+      } catch (err) {
+        if (controller.signal.aborted) {
+          const reason = controller.signal.reason;
+          if (reason === 'request-timeout' || reason === 'total-timeout') {
+            setRequestState({
+              status: 'timeout',
+              message: 'The model took too long. Your message was kept — resend to try again.',
+            });
+            recordMetric('timeout', startedAt);
+          } else {
+            setRequestState({
+              status: 'cancelled',
+              message: 'Request cancelled. Your message was kept.',
+            });
+            recordMetric('cancelled', startedAt);
+          }
+          return;
+        }
+        setRequestState({
+          status: 'error',
+          message: err instanceof Error ? err.message : 'Request failed.',
+        });
+        recordMetric('error', startedAt);
+      } finally {
+        clearTimeout(requestTimer);
+        clearTimers();
+        if (abortRef.current === controller) abortRef.current = null;
+      }
+    },
+    [cancel, clearTimers, recordMetric],
   );
 
-  return (
-    <main className="min-h-screen flex flex-col p-4">
-      <h1 className="text-lg font-semibold mb-4">ChatInput Test Harness</h1>
+  const handleSubmit = useCallback(
+    (text: string) => {
+      const trimmed = text.trim();
+      if (!trimmed) return;
+      setSent((prev) => [...prev, { text: trimmed }]);
+      // Preserve user text until the request resolves; clear only on success.
+      setValue(trimmed);
+      void runModelRequest(trimmed).then(() => {
+        setRequestState((state) => {
+          if (state.status === 'ok') setValue('');
+          return state;
+        });
+      });
+    },
+    [runModelRequest],
+  );
 
-      {/* Sent-messages log for test assertions */}
-      <ul data-testid="sent-messages" className="flex-1 mb-4 space-y-1">
-        {messages.map((m, i) => (
-          <li key={i} data-testid="sent-message" className="text-sm border rounded p-2">
-            <p>{m.text}</p>
-            {m.fact && (
-              <div
-                data-testid="fact-citation"
-                data-status={m.fact.status}
-                className="mt-2 text-xs text-gray-600 space-y-0.5"
-              >
-                <p data-testid="fact-pair">Pair: {m.fact.pair}</p>
-                <p data-testid="fact-source">
-                  Source:{' '}
-                  <a
-                    href={m.fact.sourceUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="underline"
-                  >
-                    {m.fact.source}
-                  </a>
-                </p>
-                <p data-testid="fact-observed-at">
-                  Observed at: {new Date(m.fact.observedAt).toLocaleString()}
-                </p>
-                <p data-testid="fact-valid-until">
-                  Valid until: {new Date(m.fact.validUntil).toLocaleString()}
-                </p>
-                <p data-testid="fact-status" className="font-medium">
-                  {STATUS_LABEL[m.fact.status]}
-                </p>
-                {m.fact.estimatedPayout !== undefined && (
-                  <p data-testid="fact-estimated-payout" className="italic">
-                    Estimated payout: {m.fact.estimatedPayout} (estimate only, not a
-                    guaranteed payout)
-                  </p>
-                )}
-              </div>
-            )}
-          </li>
+  const isPending = requestState.status === 'pending';
+
+  return (
+    <div>
+      <ChatInput value={value} onChange={setValue} onSubmit={handleSubmit} />
+      {isPending && (
+        <button type="button" onClick={cancel}>
+          Cancel
+        </button>
+      )}
+      {(requestState.status === 'timeout' || requestState.status === 'cancelled') && (
+        <p role="status">{requestState.message}</p>
+      )}
+      {requestState.status === 'error' && <p role="alert">{requestState.message}</p>}
+      <ul>
+        {sent.map((m, i) => (
+          <li key={i}>{m.text}</li>
         ))}
       </ul>
-
-      {/* Deterministic conversation replay for incident debugging.
-          Traces are redacted, versioned, and replayed against a pinned
-          fixture without executing any external or write tool. */}
-      <section data-testid="conversation-replay" className="mb-4 text-xs text-gray-600">
-        <h2 className="text-sm font-semibold mb-1">Conversation replay</h2>
-        <p data-testid="replay-fixture">Fixture: {SAMPLE_TRACE.fixture}</p>
-        <p data-testid="replay-version">Trace version: {SAMPLE_TRACE.version}</p>
-        <p data-testid="replay-divergences">
-          Divergences: {replayDivergences.length}
-        </p>
-        <p data-testid="replay-write-tool-executed">
-          Write tool executed: {replayExecutedWriteTool ? 'yes' : 'no'}
-        </p>
-        <ul className="ml-4 list-disc">
-          {SAMPLE_TRACE.steps.map((step) => (
-            <li key={step.index} data-testid={`replay-step-${step.index}`}>
-              {step.transition} · tool={step.tool ?? 'none'} · policy={step.policy} ·
-              outcome={step.outcome} · args={JSON.stringify(step.args)}
-            </li>
-          ))}
-        </ul>
-        <p className="italic mt-1">
-          Traces are retained in memory only; access is limited to incident
-          responders and sensitive values are redacted before recording.
-        </p>
-      </section>
-
-      {/* Locale-aware intent evaluation fixtures for offline evaluation.
-          Language interpretation is separate from canonical parsing and
-          contract unit conversion; ambiguous or unsupported input is withheld. */}
-      <section data-testid="locale-eval" className="mb-4 text-xs text-gray-600">
-        <h2 className="text-sm font-semibold mb-1">Locale intent evaluation</h2>
-        {SUPPORTED_LOCALES.map((locale) => (
-          <div key={locale.code} data-testid={`locale-${locale.code}`} className="mb-2">
-            <p className="font-medium">
-              {locale.label} (decimal &quot;{locale.decimalSeparator}&quot;, grouping
-              &quot;{locale.groupingSeparator}&quot;)
-            </p>
-            <ul className="ml-4 list-disc">
-              {locale.examples.map((ex, i) => (
-                <li
-                  key={i}
-                  data-testid={`locale-example-${locale.code}-${i}`}
-                  data-ambiguous={ex.ambiguous}
-                >
-                  {ex.utterance} →{' '}
-                  {ex.ambiguous
-                    ? 'withheld for clarification'
-                    : `${ex.canonicalAmount} ${ex.currency}`}
-                </li>
-              ))}
-            </ul>
-          </div>
+      <ul aria-label="latency-metrics">
+        {metrics.map((m, i) => (
+          <li key={i}>{`${m.outcome}:${m.durationMs}ms`}</li>
         ))}
-        <p data-testid="locale-unsupported" className="italic">
-          Unsupported languages are withheld for clarification rather than guessed.
-        </p>
-      </section>
-
-      <ChatInput
-        onSendMessage={handleSendMessage}
-        isLoading={isLoading}
-        onCancelRequest={handleCancelRequest}
-      />
-      {cancelled && (
-        <p data-testid="request-cancelled" className="mt-2 text-sm text-red-600">
-          Request cancelled
-        </p>
-      )}
-    </main>
+      </ul>
+    </div>
   );
 }
