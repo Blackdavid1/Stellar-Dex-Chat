@@ -431,6 +431,7 @@ Repo Avatar
 - **frontend:** Add dynamic theme tokens to NotificationsCenter.tsx
 - **contract:** Add explicit cancellation/refund lifecycle for pending withdrawals
 - **api:** Durable webhook deduplication, out-of-order reconciliation, retry queue, and append-only audit ledger (#35, #36, #37, #38)
+- **contract:** Multisig rotation, role capabilities, bounded heartbeat, and rate limits (#19, #20, #21, #22)
 
 ### Fixed
 
@@ -1226,6 +1227,7 @@ Repo Avatar
 - **contract:** Add stateful property-based escrow solvency harness
 - **changelog:** Update changelog [skip ci]
 - **deps:** Bump proptest
+- **changelog:** Update changelog [skip ci]
 
 ### Deprecated
 
