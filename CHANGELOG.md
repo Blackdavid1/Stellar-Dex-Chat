@@ -429,9 +429,11 @@ Repo Avatar
 - **frontend:** Add CSP and security headers in next.config.ts
 - **contract:** Include caller and ledger in deposit, withdraw, set_limit, set_operator events
 - **frontend:** Add dynamic theme tokens to NotificationsCenter.tsx
+- **api:** Circuit breaker, race-safe recipients, reconciliation, and security hardening (#47, #48, #49, #50)
 - **contract:** Add explicit cancellation/refund lifecycle for pending withdrawals
 - **api:** Durable webhook deduplication, out-of-order reconciliation, retry queue, and append-only audit ledger (#35, #36, #37, #38)
 - **contract:** Multisig rotation, role capabilities, bounded heartbeat, and rate limits (#19, #20, #21, #22)
+- Implement payout PII retention, simulation pre-sign review, pending tx recovery, and exact integer arithmetic (#51, #52, #53, #55)
 
 ### Fixed
 
@@ -1228,6 +1230,7 @@ Repo Avatar
 - **changelog:** Update changelog [skip ci]
 - **deps:** Bump proptest
 - **changelog:** Update changelog [skip ci]
+- **changelog:** Update changelog [skip ci]
 
 ### Deprecated
 
@@ -1789,3 +1792,6 @@ fix(frontend): add minimal security hardening for webhook and transfe…
 - Merge pull request #1563 from Mrwicks00/fix/1455-1458-1478-1479-ci-security-hardening
 
 Fix/1455 1458 1478 1479 ci security hardening
+- Merge pull request #154 from softnationz/feat/issues-47-48-49-50
+
+feat(api): circuit breaker, race-safe recipients, reconciliation, and security hardening (#47, #48, #49, #50)
