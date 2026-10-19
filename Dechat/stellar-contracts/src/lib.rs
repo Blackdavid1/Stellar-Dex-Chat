@@ -123,6 +123,14 @@ pub enum Error {
     ProposalAlreadyExecuted = 1106,
     ThresholdNotMet = 1107,
     MaxSignersReached = 1108,
+
+    // --- 1200 series: Cancellation lifecycle ---
+    /// A cancellation has already been requested for this withdrawal.
+    CancellationAlreadyRequested = 1201,
+    /// No cancellation request exists for this withdrawal.
+    CancellationNotRequested = 1202,
+    /// The cancellation has not been approved by an admin yet.
+    CancellationNotApproved = 1203,
 }
 
 // ── Models ────────────────────────────────────────────────────────────────
@@ -278,6 +286,47 @@ pub struct BatchHeartbeatResult {
     pub failed_index: Option<u32>,
 }
 
+/// Status of a cancellation request in the two-phase lifecycle.
+///
+/// The state machine is:
+/// ```
+/// Requested  ──(approve_cancellation)──►  Approved
+///                                              │
+///                                    (finalize_cancellation)
+///                                              │
+///                                              ▼
+///                                       [deleted from storage]
+/// ```
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CancellationStatus {
+    /// Cancellation has been requested (by user or admin) but not yet approved.
+    Requested,
+    /// Cancellation has been approved by an admin and is ready to finalize.
+    Approved,
+}
+
+/// A pending cancellation record stored alongside the original [`WithdrawRequest`].
+///
+/// Keyed by the same `request_id` as the originating withdrawal, stored under
+/// [`DataKey::CancellationRequest`].  Deleted atomically when
+/// `finalize_cancellation` executes the refund.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CancellationRequest {
+    /// Stable identifier matching the originating [`WithdrawRequest`].
+    pub request_id: u64,
+    /// Address that initiated the cancellation request (user or admin).
+    pub requested_by: Address,
+    /// Ledger at which the request was filed.
+    pub requested_at: u32,
+    /// Current lifecycle status.
+    pub status: CancellationStatus,
+    /// Remaining `amount` on the withdrawal request at the time of the
+    /// cancellation request — captures the post-partial-payment residual.
+    pub amount_at_request: i128,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TokenAllowlistEntry {
@@ -396,6 +445,43 @@ pub struct WithdrawalExecutedEvent {
 pub struct WithdrawalCancelledEvent {
     pub version: u32,
     pub request_id: u64,
+}
+
+/// Emitted when a user or admin files a cancellation request for a queued withdrawal.
+/// Indexers can correlate with the original `WithdrawalRequestedEvent` via `request_id`.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct CancellationRequestedEvent {
+    pub version: u32,
+    /// The withdrawal queue identifier.
+    pub request_id: u64,
+    /// Address that initiated the cancellation.
+    pub requested_by: Address,
+    /// Remaining amount on the withdrawal at request time.
+    pub amount_at_request: i128,
+}
+
+/// Emitted when an admin approves a pending cancellation request.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct CancellationApprovedEvent {
+    pub version: u32,
+    pub request_id: u64,
+    /// Admin that approved the cancellation.
+    pub approved_by: Address,
+}
+
+/// Emitted when a cancellation is finalized and funds are released back to escrow.
+/// Carries a link to the original withdrawal request for full auditability.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct CancellationFinalizedEvent {
+    pub version: u32,
+    pub request_id: u64,
+    /// Amount that was still outstanding and has now been released back to the pool.
+    pub released_amount: i128,
+    /// The `to` address from the original withdrawal request.
+    pub original_recipient: Address,
 }
 
 #[contractevent]
@@ -859,6 +945,8 @@ pub enum DataKey {
     UpgradeCancellationNonce(Address),
     /// Per-admin replay-protection nonce for `set_limit`.
     SetLimitNonce(Address),
+    /// Pending cancellation lifecycle record keyed by withdrawal `request_id`.
+    CancellationRequest(u64),
 }
 
 const ORACLE_PRICE_DECIMALS: i128 = 10_000_000;
@@ -1864,6 +1952,215 @@ impl FiatBridge {
         .publish(&env);
 
         Ok(())
+    }
+
+    // ── Cancellation lifecycle (Issue #14) ────────────────────────────────
+
+    /// Requests cancellation of a queued withdrawal.
+    ///
+    /// Either the withdrawal recipient (`request.to`) **or** the admin may file a
+    /// cancellation request.  This does not yet remove the withdrawal from the
+    /// queue; it creates a [`CancellationRequest`] record that must be approved
+    /// by the admin via [`approve_cancellation`] and finalised via
+    /// [`finalize_cancellation`] before any liability is released.
+    ///
+    /// # Arguments
+    /// * `env` – The Soroban host environment.
+    /// * `request_id` – Queue ID of the withdrawal to cancel.
+    /// * `caller` – Address filing the request; must be either the admin or
+    ///   the withdrawal's `to` address.
+    ///
+    /// # Errors
+    /// * [`Error::RequestNotFound`] – `request_id` does not exist.
+    /// * [`Error::ContractPaused`] – Contract is paused.
+    /// * [`Error::Unauthorized`] – `caller` is neither the admin nor `request.to`.
+    /// * [`Error::CancellationAlreadyRequested`] – A cancellation is already pending.
+    pub fn request_cancellation(
+        env: Env,
+        request_id: u64,
+        caller: Address,
+    ) -> Result<(), Error> {
+        env.storage().instance().extend_ttl(MIN_TTL, MAX_TTL);
+        Self::require_not_paused(&env)?;
+        caller.require_auth();
+
+        let request: WithdrawRequest = env
+            .storage()
+            .persistent()
+            .get(&DataKey::WithdrawQueue(request_id))
+            .ok_or(Error::RequestNotFound)?;
+
+        // Only the admin or the designated recipient may request cancellation.
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        if caller != admin && caller != request.to {
+            return Err(Error::Unauthorized);
+        }
+
+        // Guard: duplicate cancellation request.
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::CancellationRequest(request_id))
+        {
+            return Err(Error::CancellationAlreadyRequested);
+        }
+
+        let amount_at_request = request.amount;
+
+        let cancellation = CancellationRequest {
+            request_id,
+            requested_by: caller.clone(),
+            requested_at: env.ledger().sequence(),
+            status: CancellationStatus::Requested,
+            amount_at_request,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::CancellationRequest(request_id), &cancellation);
+
+        CancellationRequestedEvent {
+            version: EVENT_VERSION,
+            request_id,
+            requested_by: caller,
+            amount_at_request,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Approves a pending cancellation request filed via [`request_cancellation`].
+    ///
+    /// Only the admin may call this.  Approval advances the [`CancellationRequest`]
+    /// state from `Requested` to `Approved`, which signals that
+    /// [`finalize_cancellation`] may proceed.
+    ///
+    /// # Arguments
+    /// * `env` – The Soroban host environment.
+    /// * `request_id` – Queue ID of the withdrawal whose cancellation to approve.
+    ///
+    /// # Errors
+    /// * [`Error::ContractPaused`] – Contract is paused.
+    /// * [`Error::Unauthorized`] – Caller is not the admin.
+    /// * [`Error::CancellationNotRequested`] – No cancellation is pending for this id.
+    pub fn approve_cancellation(env: Env, request_id: u64) -> Result<(), Error> {
+        env.storage().instance().extend_ttl(MIN_TTL, MAX_TTL);
+        Self::require_not_paused(&env)?;
+        let admin = Self::require_admin(&env)?;
+
+        let mut cancellation: CancellationRequest = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CancellationRequest(request_id))
+            .ok_or(Error::CancellationNotRequested)?;
+
+        cancellation.status = CancellationStatus::Approved;
+        env.storage()
+            .persistent()
+            .set(&DataKey::CancellationRequest(request_id), &cancellation);
+
+        CancellationApprovedEvent {
+            version: EVENT_VERSION,
+            request_id,
+            approved_by: admin,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Finalizes an approved cancellation, releasing reserved liabilities and
+    /// removing the queued withdrawal.
+    ///
+    /// This is the terminal step of the cancellation lifecycle.  It requires
+    /// the associated [`CancellationRequest`] to be in the `Approved` state.
+    /// On success:
+    /// 1. The [`CancellationRequest`] record is deleted.
+    /// 2. The withdrawal is removed from the queue.
+    /// 3. Liabilities are decremented by the **current** remaining amount
+    ///    on the request (which may differ from `amount_at_request` if a
+    ///    partial execution occurred between request and finalization).
+    /// 4. [`CancellationFinalizedEvent`] and [`WithdrawalCancelledEvent`] are
+    ///    both emitted to maintain a complete, stable audit trail.
+    ///
+    /// # Arguments
+    /// * `env` – The Soroban host environment.
+    /// * `request_id` – Queue ID of the withdrawal to finalize.
+    ///
+    /// # Errors
+    /// * [`Error::ContractPaused`] – Contract is paused.
+    /// * [`Error::Unauthorized`] – Caller is not the admin.
+    /// * [`Error::CancellationNotRequested`] – No cancellation record found.
+    /// * [`Error::CancellationNotApproved`] – Cancellation exists but is not yet approved.
+    /// * [`Error::RequestNotFound`] – Underlying withdrawal no longer exists
+    ///   (e.g. fully executed before finalization).
+    pub fn finalize_cancellation(env: Env, request_id: u64) -> Result<(), Error> {
+        env.storage().instance().extend_ttl(MIN_TTL, MAX_TTL);
+        Self::require_not_paused(&env)?;
+        let _admin = Self::require_admin(&env)?;
+
+        let cancellation: CancellationRequest = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CancellationRequest(request_id))
+            .ok_or(Error::CancellationNotRequested)?;
+
+        if cancellation.status != CancellationStatus::Approved {
+            return Err(Error::CancellationNotApproved);
+        }
+
+        // The withdrawal must still exist; it may have been partially executed.
+        let request: WithdrawRequest = env
+            .storage()
+            .persistent()
+            .get(&DataKey::WithdrawQueue(request_id))
+            .ok_or(Error::RequestNotFound)?;
+
+        // Use the current residual amount, not the snapshot, so a partial
+        // execution that happened between request and finalization is honoured.
+        let released_amount = request.amount;
+        let original_recipient = request.to.clone();
+
+        // Clean up the cancellation record before mutating queue state.
+        env.storage()
+            .persistent()
+            .remove(&DataKey::CancellationRequest(request_id));
+
+        Self::release_liability(&env, &request.token, released_amount)?;
+        Self::remove_from_withdraw_queue(&env, request_id, &request);
+
+        Self::check_invariants(&env, &request.token)?;
+
+        // Emit both events: the stable `WithdrawalCancelledEvent` for backward
+        // compatibility with existing indexers, and the new richer event.
+        WithdrawalCancelledEvent {
+            version: EVENT_VERSION,
+            request_id,
+        }
+        .publish(&env);
+
+        CancellationFinalizedEvent {
+            version: EVENT_VERSION,
+            request_id,
+            released_amount,
+            original_recipient,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Returns the pending [`CancellationRequest`] for `request_id`, if any.
+    ///
+    /// Returns `None` when no cancellation has been filed.
+    pub fn get_cancellation_request(env: Env, request_id: u64) -> Option<CancellationRequest> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CancellationRequest(request_id))
     }
 
     /// Reclaim an expired withdrawal request.
@@ -5535,3 +5832,9 @@ mod test_denylist_invariants;
 
 #[cfg(test)]
 mod test_token_allowlist_invariants;
+
+#[cfg(test)]
+mod test_cancellation_lifecycle_invariants;
+
+#[cfg(test)]
+mod test_escrow_solvency_proptest;
