@@ -429,6 +429,7 @@ Repo Avatar
 - **frontend:** Add CSP and security headers in next.config.ts
 - **contract:** Include caller and ledger in deposit, withdraw, set_limit, set_operator events
 - **frontend:** Add dynamic theme tokens to NotificationsCenter.tsx
+- **contract:** Add explicit cancellation/refund lifecycle for pending withdrawals
 
 ### Fixed
 
@@ -1216,6 +1217,8 @@ Repo Avatar
 - **changelog:** Update changelog [skip ci]
 - **contract:** Add Soroban invariant tests for get_fee_withdrawal_nonce
 - **changelog:** Update changelog [skip ci]
+- **changelog:** Update changelog [skip ci]
+- **contract:** Add stateful property-based escrow solvency harness
 
 ### Deprecated
 
