@@ -1,336 +1,137 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
 import {
-  clearTransferStore,
-  getTransferStatus,
-  setTransferStatus,
-  TransferStatusRecord,
-} from '@/lib/transferStore';
-import {
-  calculateNextRetry,
-  isValidPayoutTransition,
-  reconcileSinglePayout,
-  reconcileStalePayouts,
-  selectStalePayouts,
+  PayoutReconciliationService,
+  DomainPayoutStatus,
 } from './reconciliation';
-import type { PayoutProvider } from './providers/types';
+import { PayoutAuditLedger } from './auditLedger';
 
-vi.mock('server-only', () => ({}));
+describe('PayoutReconciliationService', () => {
+  let tempDir: string;
+  let auditLedger: PayoutAuditLedger;
+  let service: PayoutReconciliationService;
 
-describe('Payout Reconciliation', () => {
   beforeEach(() => {
-    clearTransferStore();
-    vi.clearAllMocks();
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'reconciliation-test-'));
+    auditLedger = new PayoutAuditLedger(tempDir);
+    service = new PayoutReconciliationService(tempDir, auditLedger);
   });
 
-  describe('State Machine Transitions', () => {
-    it('allows valid transitions from pending to terminal states and pending', () => {
-      expect(isValidPayoutTransition('pending', 'success')).toBe(true);
-      expect(isValidPayoutTransition('pending', 'failed')).toBe(true);
-      expect(isValidPayoutTransition('pending', 'reversed')).toBe(true);
-      expect(isValidPayoutTransition('pending', 'cancelled')).toBe(true);
-      expect(isValidPayoutTransition('pending', 'pending')).toBe(true);
-    });
-
-    it('rejects any transition from a terminal state', () => {
-      expect(isValidPayoutTransition('success', 'failed')).toBe(false);
-      expect(isValidPayoutTransition('success', 'pending')).toBe(false);
-      expect(isValidPayoutTransition('failed', 'success')).toBe(false);
-      expect(isValidPayoutTransition('reversed', 'success')).toBe(false);
-      expect(isValidPayoutTransition('cancelled', 'success')).toBe(false);
-    });
+  afterEach(() => {
+    try {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    } catch {}
   });
 
-  describe('selectStalePayouts with fake clock', () => {
-    const FAKE_NOW = 1_000_000;
-    const FIVE_MINS = 5 * 60 * 1000;
-
-    it('selects pending records older than staleAgeMs', () => {
-      const staleRecord: TransferStatusRecord = {
-        reference: 'tx_stale',
-        status: 'pending',
-        amount: 100,
-        updatedAt: new Date(FAKE_NOW - FIVE_MINS - 1000).toISOString(),
-        updatedAtMs: FAKE_NOW - FIVE_MINS - 1000,
-      };
-
-      const selected = selectStalePayouts([staleRecord], {
-        clock: () => FAKE_NOW,
-        staleAgeMs: FIVE_MINS,
-      });
-
-      expect(selected).toHaveLength(1);
-      expect(selected[0].reference).toBe('tx_stale');
+  it('allows forward monotonic transitions', () => {
+    const res1 = service.reconcileEvent({
+      eventId: 'evt_1',
+      payoutReference: 'ref_100',
+      eventType: 'transfer.success',
+      currentStatus: 'pending',
     });
+    expect(res1.decision).toBe('APPLIED');
+    expect(res1.effectiveStatus).toBe('success');
 
-    it('skips recently updated pending records', () => {
-      const recentRecord: TransferStatusRecord = {
-        reference: 'tx_recent',
-        status: 'pending',
-        amount: 100,
-        updatedAt: new Date(FAKE_NOW - 1000).toISOString(),
-        updatedAtMs: FAKE_NOW - 1000,
-      };
-
-      const selected = selectStalePayouts([recentRecord], {
-        clock: () => FAKE_NOW,
-        staleAgeMs: FIVE_MINS,
-      });
-
-      expect(selected).toHaveLength(0);
+    const res2 = service.reconcileEvent({
+      eventId: 'evt_2',
+      payoutReference: 'ref_100',
+      eventType: 'transfer.reversed',
+      currentStatus: 'success',
     });
-
-    it('skips terminal records even if they are older than staleAgeMs', () => {
-      const successRecord: TransferStatusRecord = {
-        reference: 'tx_success',
-        status: 'success',
-        amount: 100,
-        updatedAt: new Date(FAKE_NOW - FIVE_MINS - 10_000).toISOString(),
-        updatedAtMs: FAKE_NOW - FIVE_MINS - 10_000,
-      };
-      const failedRecord: TransferStatusRecord = {
-        reference: 'tx_failed',
-        status: 'failed',
-        amount: 100,
-        updatedAt: new Date(FAKE_NOW - FIVE_MINS - 10_000).toISOString(),
-        updatedAtMs: FAKE_NOW - FIVE_MINS - 10_000,
-      };
-
-      const selected = selectStalePayouts([successRecord, failedRecord], {
-        clock: () => FAKE_NOW,
-        staleAgeMs: FIVE_MINS,
-      });
-
-      expect(selected).toHaveLength(0);
-    });
-
-    it('skips records whose scheduled nextRetryAt is in the future', () => {
-      const pendingRetryInFuture: TransferStatusRecord = {
-        reference: 'tx_future_retry',
-        status: 'pending',
-        amount: 100,
-        updatedAt: new Date(FAKE_NOW - FIVE_MINS - 1000).toISOString(),
-        updatedAtMs: FAKE_NOW - FIVE_MINS - 1000,
-        nextRetryAt: FAKE_NOW + 30_000, // 30s in future
-      };
-
-      const selected = selectStalePayouts([pendingRetryInFuture], {
-        clock: () => FAKE_NOW,
-        staleAgeMs: FIVE_MINS,
-      });
-
-      expect(selected).toHaveLength(0);
-    });
-
-    it('respects bounded batch size', () => {
-      const records: TransferStatusRecord[] = Array.from({ length: 10 }).map(
-        (_, i) => ({
-          reference: `tx_${i}`,
-          status: 'pending',
-          amount: 50,
-          updatedAt: new Date(FAKE_NOW - FIVE_MINS - 5000).toISOString(),
-          updatedAtMs: FAKE_NOW - FIVE_MINS - 5000,
-        }),
-      );
-
-      const selected = selectStalePayouts(records, {
-        clock: () => FAKE_NOW,
-        batchSize: 3,
-      });
-
-      expect(selected).toHaveLength(3);
-    });
+    expect(res2.decision).toBe('APPLIED');
+    expect(res2.effectiveStatus).toBe('reversed');
   });
 
-  describe('reconcileSinglePayout with fake clock and provider mocks', () => {
-    const FAKE_NOW = 2_000_000;
+  it('rejects out-of-order regression from reversed to earlier states', () => {
+    // Current state is already reversed
+    const currentStatus: DomainPayoutStatus = 'reversed';
 
-    const createMockProvider = (
-      checkStatusImpl: (ref: string) => Promise<any>,
-    ): PayoutProvider => ({
-      name: 'paystack',
-      verifyAccount: vi.fn(),
-      createRecipient: vi.fn(),
-      initiateTransfer: vi.fn(), // MUST NOT BE CALLED
-      checkTransferStatus: vi.fn().mockImplementation(checkStatusImpl),
+    const res = service.reconcileEvent({
+      eventId: 'evt_stale_success',
+      payoutReference: 'ref_rev',
+      eventType: 'transfer.success',
+      currentStatus,
     });
 
-    it('updates pending transfer to success on authoritative provider success', async () => {
-      const mockProvider = createMockProvider(async (ref) => ({
-        status: 'success',
-        reference: ref,
-      }));
+    expect(res.decision).toBe('REJECTED_OUT_OF_ORDER');
+    expect(res.effectiveStatus).toBe('reversed');
+    expect(res.reason).toMatch(/cannot transition to success/i);
 
-      const record: TransferStatusRecord = {
-        reference: 'tx_reconcile_success',
-        status: 'pending',
-        amount: 250,
-        updatedAt: new Date(FAKE_NOW - 400_000).toISOString(),
-        updatedAtMs: FAKE_NOW - 400_000,
-      };
-      setTransferStatus(record);
+    // Stored for investigation
+    const rejected = service.getRejectedEvents({ payoutReference: 'ref_rev' });
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0].eventId).toBe('evt_stale_success');
+    expect(rejected[0].targetStatus).toBe('success');
 
-      const result = await reconcileSinglePayout(record, mockProvider, {
-        clock: () => FAKE_NOW,
-      });
-
-      expect(result.result).toBe('transitioned');
-      expect(result.previousStatus).toBe('pending');
-      expect(result.newStatus).toBe('success');
-      expect(result.attempts).toBe(1);
-      expect(mockProvider.checkTransferStatus).toHaveBeenCalledWith({
-        reference: 'tx_reconcile_success',
-      });
-      // CRITICAL: verify initiateTransfer was never called
-      expect(mockProvider.initiateTransfer).not.toHaveBeenCalled();
-
-      // Check updated store record
-      const stored = getTransferStatus('tx_reconcile_success');
-      expect(stored?.status).toBe('success');
-      expect(stored?.reconciliationAttempts).toBe(1);
-      expect(stored?.lastReconciliationResult).toBe('transitioned');
-      expect(stored?.nextRetryAt).toBeUndefined(); // terminal status, no next retry
-    });
-
-    it('updates pending transfer to failed on provider failure', async () => {
-      const mockProvider = createMockProvider(async (ref) => ({
-        data: { status: 'failed', reference: ref },
-      }));
-
-      const record: TransferStatusRecord = {
-        reference: 'tx_reconcile_failed',
-        status: 'pending',
-        amount: 150,
-        updatedAt: new Date(FAKE_NOW - 400_000).toISOString(),
-        updatedAtMs: FAKE_NOW - 400_000,
-      };
-      setTransferStatus(record);
-
-      const result = await reconcileSinglePayout(record, mockProvider, {
-        clock: () => FAKE_NOW,
-      });
-
-      expect(result.result).toBe('transitioned');
-      expect(result.newStatus).toBe('failed');
-      expect(mockProvider.initiateTransfer).not.toHaveBeenCalled();
-
-      const stored = getTransferStatus('tx_reconcile_failed');
-      expect(stored?.status).toBe('failed');
-    });
-
-    it('records provider unavailable and schedules exponential nextRetryAt without crashing', async () => {
-      const outageError = { isAxiosError: true, response: { status: 503 } };
-      const mockProvider = createMockProvider(async () => {
-        throw outageError;
-      });
-
-      const record: TransferStatusRecord = {
-        reference: 'tx_outage',
-        status: 'pending',
-        amount: 300,
-        reconciliationAttempts: 1,
-        updatedAt: new Date(FAKE_NOW - 400_000).toISOString(),
-        updatedAtMs: FAKE_NOW - 400_000,
-      };
-      setTransferStatus(record);
-
-      const result = await reconcileSinglePayout(record, mockProvider, {
-        clock: () => FAKE_NOW,
-        baseRetryDelayMs: 60_000,
-      });
-
-      expect(result.result).toBe('provider_unavailable');
-      expect(result.newStatus).toBe('pending');
-      expect(result.attempts).toBe(2);
-      // Attempt 2 backoff: 60_000 * 2^(2 - 1) = 120_000
-      expect(result.nextRetryAt).toBe(FAKE_NOW + 120_000);
-
-      const stored = getTransferStatus('tx_outage');
-      expect(stored?.status).toBe('pending');
-      expect(stored?.reconciliationAttempts).toBe(2);
-      expect(stored?.lastReconciliationResult).toBe('provider_unavailable');
-      expect(stored?.nextRetryAt).toBe(FAKE_NOW + 120_000);
-    });
-
-    it('keeps pending state and schedules next retry if provider still reports pending', async () => {
-      const mockProvider = createMockProvider(async () => ({
-        status: 'pending',
-      }));
-
-      const record: TransferStatusRecord = {
-        reference: 'tx_still_pending',
-        status: 'pending',
-        amount: 75,
-        updatedAt: new Date(FAKE_NOW - 400_000).toISOString(),
-        updatedAtMs: FAKE_NOW - 400_000,
-      };
-      setTransferStatus(record);
-
-      const result = await reconcileSinglePayout(record, mockProvider, {
-        clock: () => FAKE_NOW,
-        baseRetryDelayMs: 30_000,
-      });
-
-      expect(result.result).toBe('no_change');
-      expect(result.newStatus).toBe('pending');
-      expect(result.attempts).toBe(1);
-      expect(result.nextRetryAt).toBe(FAKE_NOW + 30_000);
-    });
+    // Audit ledger records the rejection
+    const auditEntries = auditLedger.getEntries({
+      payoutId: 'ref_rev',
+    }).entries;
+    expect(auditEntries.some((e) => e.action === 'payout_event_rejected')).toBe(
+      true,
+    );
   });
 
-  describe('reconcileStalePayouts batch processing', () => {
-    it('processes stale records and aggregates batch result', async () => {
-      const FAKE_NOW = 3_000_000;
-      const mockProvider: PayoutProvider = {
-        name: 'paystack',
-        verifyAccount: vi.fn(),
-        createRecipient: vi.fn(),
-        initiateTransfer: vi.fn(),
-        checkTransferStatus: vi
-          .fn()
-          .mockImplementation(async ({ reference }) => {
-            if (reference === 'stale_success') return { status: 'success' };
-            if (reference === 'stale_failed') return { status: 'failed' };
-            throw { isAxiosError: true, response: { status: 500 } };
-          }),
-      };
+  it('replays fixtures in multiple delivery orders and yields identical final state', () => {
+    interface FixtureEvent {
+      id: string;
+      type: string;
+    }
 
-      setTransferStatus({
-        reference: 'stale_success',
-        status: 'pending',
-        amount: 100,
-        updatedAt: new Date(FAKE_NOW - 600_000).toISOString(),
-        updatedAtMs: FAKE_NOW - 600_000,
-      });
-      setTransferStatus({
-        reference: 'stale_failed',
-        status: 'pending',
-        amount: 200,
-        updatedAt: new Date(FAKE_NOW - 600_000).toISOString(),
-        updatedAtMs: FAKE_NOW - 600_000,
-      });
-      setTransferStatus({
-        reference: 'stale_error',
-        status: 'pending',
-        amount: 300,
-        updatedAt: new Date(FAKE_NOW - 600_000).toISOString(),
-        updatedAtMs: FAKE_NOW - 600_000,
-      });
-      setTransferStatus({
-        reference: 'already_terminal',
-        status: 'success',
-        amount: 400,
-        updatedAt: new Date(FAKE_NOW - 600_000).toISOString(),
-        updatedAtMs: FAKE_NOW - 600_000,
-      });
+    const fixtures: FixtureEvent[] = [
+      { id: 'evt_succ', type: 'transfer.success' },
+      { id: 'evt_rev', type: 'transfer.reversed' },
+    ];
 
-      const batchSummary = await reconcileStalePayouts({
-        provider: mockProvider,
-        clock: () => FAKE_NOW,
-      });
+    const replaySequence = (events: FixtureEvent[]): DomainPayoutStatus => {
+      let state: DomainPayoutStatus = 'pending';
+      for (const ev of events) {
+        const dec = service.reconcileEvent({
+          eventId: ev.id,
+          payoutReference: 'ref_fixture',
+          eventType: ev.type,
+          currentStatus: state,
+        });
+        state = dec.effectiveStatus;
+      }
+      return state;
+    };
 
-      expect(batchSummary.processed).toBe(3); // 'already_terminal' was skipped
-      expect(batchSummary.transitioned).toBe(2);
-      expect(batchSummary.providerUnavailable).toBe(1);
+    // Forward order: success then reversed
+    const finalOrder1 = replaySequence([fixtures[0], fixtures[1]]);
+    expect(finalOrder1).toBe('reversed');
+
+    // Out-of-order: reversed arrives before success
+    const finalOrder2 = replaySequence([fixtures[1], fixtures[0]]);
+    expect(finalOrder2).toBe('reversed');
+
+    // Both result in identical final state
+    expect(finalOrder1).toBe(finalOrder2);
+  });
+
+  it('stores and retrieves rejected events for investigation across restarts', () => {
+    service.reconcileEvent({
+      eventId: 'evt_delayed',
+      payoutReference: 'ref_investigate',
+      eventType: 'transfer.success',
+      currentStatus: 'reversed',
+      payload: { note: 'delayed webhook callback' },
     });
+
+    // Simulate restart with new service instance on same storage directory
+    const restartedService = new PayoutReconciliationService(
+      tempDir,
+      auditLedger,
+    );
+    const rejected = restartedService.getRejectedEvents({
+      payoutReference: 'ref_investigate',
+    });
+
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0].eventId).toBe('evt_delayed');
+    expect(rejected[0].payload).toEqual({ note: 'delayed webhook callback' });
   });
 });

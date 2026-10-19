@@ -1173,6 +1173,514 @@ fn test_fallback_oracle_still_fails_when_both_stale() {
     assert_eq!(result, Err(Ok(Error::OraclePriceInvalid)));
 }
 
+// ── Issue #7 / #8: oracle freshness, confidence and conversion tests ─────
+
+/// Oracle returning a fully-populated, fresh observation.
+#[contract]
+pub struct FreshOracle;
+
+#[contractimpl]
+impl FreshOracle {
+    pub fn get_price(_env: Env, _token: Address) -> Option<i128> {
+        Some(10_000_000)
+    }
+
+    pub fn get_observation(env: Env, _token: Address) -> Option<OracleObservation> {
+        Some(OracleObservation {
+            price: 10_000_000,
+            confidence_bps: 10_000,
+            observed_ledger: env.ledger().sequence(),
+            observed_timestamp: env.ledger().timestamp(),
+        })
+    }
+}
+
+/// Oracle returning a fresh observation with a configurable confidence.
+#[contract]
+pub struct ConfidenceOracle;
+
+#[contractimpl]
+impl ConfidenceOracle {
+    pub fn get_price(_env: Env, _token: Address) -> Option<i128> {
+        Some(10_000_000)
+    }
+
+    pub fn get_observation(env: Env, _token: Address) -> Option<OracleObservation> {
+        Some(OracleObservation {
+            price: 10_000_000,
+            confidence_bps: 5_000,
+            observed_ledger: env.ledger().sequence(),
+            observed_timestamp: env.ledger().timestamp(),
+        })
+    }
+}
+
+/// Oracle returning an observation anchored far in the past.
+#[contract]
+pub struct StaleObservationOracle;
+
+#[contractimpl]
+impl StaleObservationOracle {
+    pub fn get_price(_env: Env, _token: Address) -> Option<i128> {
+        Some(10_000_000)
+    }
+
+    pub fn get_observation(env: Env, _token: Address) -> Option<OracleObservation> {
+        Some(OracleObservation {
+            price: 10_000_000,
+            confidence_bps: 10_000,
+            observed_ledger: env.ledger().sequence().saturating_sub(10_000),
+            observed_timestamp: env.ledger().timestamp(),
+        })
+    }
+}
+
+/// Oracle returning an observation dated in the future.
+#[contract]
+pub struct FutureObservationOracle;
+
+#[contractimpl]
+impl FutureObservationOracle {
+    pub fn get_price(_env: Env, _token: Address) -> Option<i128> {
+        Some(10_000_000)
+    }
+
+    pub fn get_observation(env: Env, _token: Address) -> Option<OracleObservation> {
+        Some(OracleObservation {
+            price: 10_000_000,
+            confidence_bps: 10_000,
+            observed_ledger: env.ledger().sequence().saturating_add(1_000),
+            observed_timestamp: env.ledger().timestamp(),
+        })
+    }
+}
+
+/// Oracle that exposes no observation interface at all (missing data).
+#[contract]
+pub struct MissingObservationOracle;
+
+#[contractimpl]
+impl MissingObservationOracle {
+    pub fn get_price(_env: Env, _token: Address) -> Option<i128> {
+        Some(10_000_000)
+    }
+}
+
+fn setup_oracle_bridge<'a>(
+    env: &'a Env,
+    limit: i128,
+) -> (
+    Address,
+    FiatBridgeClient<'a>,
+    Address,
+    TokenClient<'a>,
+    StellarAssetClient<'a>,
+) {
+    let (contract_id, bridge, _admin, token_addr, token, token_sac) = setup_bridge(env, limit);
+    (contract_id, bridge, token_addr, token, token_sac)
+}
+
+#[test]
+fn test_oracle_config_setters_round_trip() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, bridge, _, _, _) = setup_oracle_bridge(&env, 10_000);
+
+    bridge.set_oracle_max_age(&100);
+    assert_eq!(bridge.get_oracle_max_age(), 100);
+
+    bridge.set_oracle_min_confidence(&9_000);
+    assert_eq!(bridge.get_oracle_min_confidence(), 9_000);
+}
+
+#[test]
+fn test_oracle_fresh_observation_accepted() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, bridge, token_addr, token, token_sac) = setup_oracle_bridge(&env, 10_000);
+    let oracle_id = env.register(FreshOracle, ());
+    bridge.set_oracle(&oracle_id);
+    bridge.set_oracle_max_age(&100);
+    bridge.set_oracle_min_confidence(&9_000);
+
+    let user = Address::generate(&env);
+    token_sac.mint(&user, &5_000);
+
+    bridge.deposit(&user, &1_000, &token_addr, &Bytes::new(&env), &10_000_000, &0, &None);
+    assert_eq!(token.balance(&user), 4_000);
+}
+
+#[test]
+fn test_oracle_stale_observation_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, bridge, token_addr, _, token_sac) = setup_oracle_bridge(&env, 10_000);
+    let oracle_id = env.register(StaleObservationOracle, ());
+    bridge.set_oracle(&oracle_id);
+    bridge.set_oracle_max_age(&100);
+    bridge.set_oracle_min_confidence(&9_000);
+
+    let user = Address::generate(&env);
+    token_sac.mint(&user, &5_000);
+
+    let result = bridge.try_deposit(
+        &user,
+        &1_000,
+        &token_addr,
+        &Bytes::new(&env),
+        &10_000_000,
+        &0,
+        &None,
+    );
+    assert_eq!(result, Err(Ok(Error::OracleStale)));
+}
+
+#[test]
+fn test_oracle_future_dated_observation_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, bridge, token_addr, _, token_sac) = setup_oracle_bridge(&env, 10_000);
+    let oracle_id = env.register(FutureObservationOracle, ());
+    bridge.set_oracle(&oracle_id);
+    bridge.set_oracle_max_age(&100);
+    bridge.set_oracle_min_confidence(&9_000);
+
+    let user = Address::generate(&env);
+    token_sac.mint(&user, &5_000);
+
+    let result = bridge.try_deposit(
+        &user,
+        &1_000,
+        &token_addr,
+        &Bytes::new(&env),
+        &10_000_000,
+        &0,
+        &None,
+    );
+    assert_eq!(result, Err(Ok(Error::OracleFutureDated)));
+}
+
+#[test]
+fn test_oracle_missing_observation_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, bridge, token_addr, _, token_sac) = setup_oracle_bridge(&env, 10_000);
+    let oracle_id = env.register(MissingObservationOracle, ());
+    bridge.set_oracle(&oracle_id);
+    bridge.set_oracle_max_age(&100);
+    bridge.set_oracle_min_confidence(&9_000);
+
+    let user = Address::generate(&env);
+    token_sac.mint(&user, &5_000);
+
+    let result = bridge.try_deposit(
+        &user,
+        &1_000,
+        &token_addr,
+        &Bytes::new(&env),
+        &10_000_000,
+        &0,
+        &None,
+    );
+    assert_eq!(result, Err(Ok(Error::OracleObservationMissing)));
+}
+
+#[test]
+fn test_oracle_low_confidence_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, bridge, token_addr, _, token_sac) = setup_oracle_bridge(&env, 10_000);
+    let oracle_id = env.register(ConfidenceOracle, ());
+    bridge.set_oracle(&oracle_id);
+    bridge.set_oracle_max_age(&100);
+    bridge.set_oracle_min_confidence(&9_000);
+
+    let user = Address::generate(&env);
+    token_sac.mint(&user, &5_000);
+
+    let result = bridge.try_deposit(
+        &user,
+        &1_000,
+        &token_addr,
+        &Bytes::new(&env),
+        &10_000_000,
+        &0,
+        &None,
+    );
+    assert_eq!(result, Err(Ok(Error::OracleConfidenceTooLow)));
+}
+
+#[test]
+fn test_oracle_confidence_at_exact_threshold_accepted() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, bridge, token_addr, _, token_sac) = setup_oracle_bridge(&env, 10_000);
+    let oracle_id = env.register(ConfidenceOracle, ());
+    bridge.set_oracle(&oracle_id);
+    bridge.set_oracle_max_age(&100);
+    // ConfidenceOracle reports exactly 5_000 bps.
+    bridge.set_oracle_min_confidence(&5_000);
+
+    let user = Address::generate(&env);
+    token_sac.mint(&user, &5_000);
+
+    bridge.deposit(&user, &1_000, &token_addr, &Bytes::new(&env), &10_000_000, &0, &None);
+}
+
+#[test]
+fn test_oracle_confidence_one_bps_below_threshold_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, bridge, token_addr, _, token_sac) = setup_oracle_bridge(&env, 10_000);
+    let oracle_id = env.register(ConfidenceOracle, ());
+    bridge.set_oracle(&oracle_id);
+    bridge.set_oracle_max_age(&100);
+    bridge.set_oracle_min_confidence(&5_001);
+
+    let user = Address::generate(&env);
+    token_sac.mint(&user, &5_000);
+
+    let result = bridge.try_deposit(
+        &user,
+        &1_000,
+        &token_addr,
+        &Bytes::new(&env),
+        &10_000_000,
+        &0,
+        &None,
+    );
+    assert_eq!(result, Err(Ok(Error::OracleConfidenceTooLow)));
+}
+
+#[test]
+fn test_oracle_age_at_exact_threshold_accepted() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, bridge, token_addr, _, token_sac) = setup_oracle_bridge(&env, 10_000);
+    let oracle_id = env.register(FreshOracle, ());
+    bridge.set_oracle(&oracle_id);
+    bridge.set_oracle_max_age(&0);
+    bridge.set_oracle_min_confidence(&0);
+
+    let user = Address::generate(&env);
+    token_sac.mint(&user, &5_000);
+
+    // Observation is stamped at the current ledger, so age == 0 == max age.
+    bridge.deposit(&user, &1_000, &token_addr, &Bytes::new(&env), &10_000_000, &0, &None);
+}
+
+#[test]
+fn test_oracle_age_one_ledger_past_threshold_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, bridge, token_addr, _, token_sac) = setup_oracle_bridge(&env, 10_000);
+    let oracle_id = env.register(FreshOracle, ());
+    bridge.set_oracle(&oracle_id);
+    bridge.set_oracle_max_age(&0);
+    bridge.set_oracle_min_confidence(&0);
+
+    let user = Address::generate(&env);
+    token_sac.mint(&user, &5_000);
+
+    // Advance the ledger so the observation becomes one ledger stale.
+    let now = env.ledger().sequence();
+    env.ledger().with_mut(|li| {
+        li.sequence_number = now + 1;
+    });
+
+    let result = bridge.try_deposit(
+        &user,
+        &1_000,
+        &token_addr,
+        &Bytes::new(&env),
+        &10_000_000,
+        &0,
+        &None,
+    );
+    assert_eq!(result, Err(Ok(Error::OracleStale)));
+}
+
+#[test]
+fn test_oracle_rejection_emits_diagnostic_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (contract_id, bridge, token_addr, _, token_sac) = setup_oracle_bridge(&env, 10_000);
+    let oracle_id = env.register(StaleObservationOracle, ());
+    bridge.set_oracle(&oracle_id);
+    bridge.set_oracle_max_age(&100);
+    bridge.set_oracle_min_confidence(&9_000);
+
+    let user = Address::generate(&env);
+    token_sac.mint(&user, &5_000);
+
+    let _ = bridge.try_deposit(
+        &user,
+        &1_000,
+        &token_addr,
+        &Bytes::new(&env),
+        &10_000_000,
+        &0,
+        &None,
+    );
+
+    let events = env.events().all().filter_by_contract(&contract_id);
+    let raw = events.events();
+    let topic_symbol = soroban_sdk::xdr::ScVal::Symbol(soroban_sdk::xdr::ScSymbol(
+        soroban_sdk::xdr::StringM::try_from("oracle_rejected_event").expect("event topic"),
+    ));
+    let mut found = false;
+    for event in raw.iter() {
+        use soroban_sdk::xdr::ContractEventBody;
+        let ContractEventBody::V0(body) = &event.body;
+        if body.topics.contains(&topic_symbol) {
+            found = true;
+            break;
+        }
+    }
+    assert!(found, "expected OracleRejectedEvent on bridge");
+}
+
+#[test]
+fn test_withdrawal_rejects_stale_oracle() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, bridge, token_addr, _, token_sac) = setup_oracle_bridge(&env, 10_000);
+    let oracle_id = env.register(StaleObservationOracle, ());
+    bridge.set_oracle(&oracle_id);
+    bridge.set_oracle_max_age(&100);
+    bridge.set_oracle_min_confidence(&9_000);
+
+    let user = Address::generate(&env);
+    token_sac.mint(&user, &5_000);
+    bridge.deposit(&user, &1_000, &token_addr, &Bytes::new(&env), &0, &0, &None);
+
+    let result = bridge.try_request_withdrawal(&user, &100, &token_addr, &None, &0);
+    assert_eq!(result, Err(Ok(Error::OracleStale)));
+}
+
+#[test]
+fn test_conversion_helper_zero_price() {
+    let env = Env::default();
+    assert_eq!(convert_oracle_price(&env, 0, 7, 7, 10_000_000), Ok(0));
+}
+
+#[test]
+fn test_conversion_helper_max_decimals() {
+    let env = Env::default();
+    // 18 token decimals and 18 oracle decimals at a 1:1 price.
+    let one_token = 10i128.pow(18);
+    assert_eq!(
+        convert_oracle_price(&env, one_token, 18, 18, 10_000_000),
+        Ok(10_000_000)
+    );
+}
+
+#[test]
+fn test_conversion_helper_extreme_price() {
+    let env = Env::default();
+    // Very large price with zero decimals must not overflow.
+    let result = convert_oracle_price(&env, 1_000, 0, 0, i128::MAX / 2);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn test_conversion_helper_overflow_is_checked() {
+    let env = Env::default();
+    let result = convert_oracle_price(&env, i128::MAX, 18, 0, i128::MAX);
+    assert_eq!(result, Err(Error::Overflow));
+}
+
+#[test]
+fn test_deposit_one_unit_below_limit_accepted() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, bridge, token_addr, _, token_sac) = setup_oracle_bridge(&env, 1_000);
+    let oracle_id = env.register(FreshOracle, ());
+    bridge.set_oracle(&oracle_id);
+    bridge.set_oracle_max_age(&100);
+    bridge.set_oracle_min_confidence(&9_000);
+
+    let user = Address::generate(&env);
+    token_sac.mint(&user, &5_000);
+
+    bridge.deposit(&user, &999, &token_addr, &Bytes::new(&env), &10_000_000, &0, &None);
+}
+
+#[test]
+fn test_deposit_at_limit_accepted() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, bridge, token_addr, _, token_sac) = setup_oracle_bridge(&env, 1_000);
+    let oracle_id = env.register(FreshOracle, ());
+    bridge.set_oracle(&oracle_id);
+    bridge.set_oracle_max_age(&100);
+    bridge.set_oracle_min_confidence(&9_000);
+
+    let user = Address::generate(&env);
+    token_sac.mint(&user, &5_000);
+
+    bridge.deposit(&user, &1_000, &token_addr, &Bytes::new(&env), &10_000_000, &0, &None);
+}
+
+#[test]
+fn test_deposit_one_unit_above_limit_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, bridge, token_addr, _, token_sac) = setup_oracle_bridge(&env, 1_000);
+    let oracle_id = env.register(FreshOracle, ());
+    bridge.set_oracle(&oracle_id);
+    bridge.set_oracle_max_age(&100);
+    bridge.set_oracle_min_confidence(&9_000);
+
+    let user = Address::generate(&env);
+    token_sac.mint(&user, &5_000);
+
+    let result = bridge.try_deposit(
+        &user,
+        &1_001,
+        &token_addr,
+        &Bytes::new(&env),
+        &10_000_000,
+        &0,
+        &None,
+    );
+    assert_eq!(result, Err(Ok(Error::ExceedsLimit)));
+}
+
+#[test]
+fn test_withdrawal_one_unit_above_limit_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, bridge, token_addr, _, token_sac) = setup_oracle_bridge(&env, 1_000);
+    let oracle_id = env.register(FreshOracle, ());
+    bridge.set_oracle(&oracle_id);
+    bridge.set_oracle_max_age(&100);
+    bridge.set_oracle_min_confidence(&9_000);
+
+    let user = Address::generate(&env);
+    token_sac.mint(&user, &5_000);
+    bridge.deposit(&user, &1_000, &token_addr, &Bytes::new(&env), &10_000_000, &0, &None);
+
+    let result = bridge.try_request_withdrawal(&user, &1_001, &token_addr, &None, &0);
+    assert_eq!(result, Err(Ok(Error::ExceedsLimit)));
+}
+
 // ── event versioning tests ────────────────────────────────────────────────
 #[test]
 fn test_event_version_constant() {

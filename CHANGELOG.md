@@ -429,6 +429,9 @@ Repo Avatar
 - **frontend:** Add CSP and security headers in next.config.ts
 - **contract:** Include caller and ledger in deposit, withdraw, set_limit, set_operator events
 - **frontend:** Add dynamic theme tokens to NotificationsCenter.tsx
+- **contract:** Add explicit cancellation/refund lifecycle for pending withdrawals
+- **api:** Durable webhook deduplication, out-of-order reconciliation, retry queue, and append-only audit ledger (#35, #36, #37, #38)
+- **contract:** Multisig rotation, role capabilities, bounded heartbeat, and rate limits (#19, #20, #21, #22)
 
 ### Fixed
 
@@ -902,6 +905,10 @@ Repo Avatar
 - **frontend:** Remove duplicate closing p tag in LandingPage
 - **frontend:** Remove unused CheckCircle import from LandingPage
 - **frontend:** Address issues 1510, 1513, 1515, 1518
+- #107 feat(ai): show source and timestamp for factual rate and payou
+- #108 feat(ai): add locale-aware intent evaluation without changing
+- #109 feat(ai): add deterministic conversation replay for incident d
+- #110 perf(ai): add bounded timeouts and cancellation for model requ
 
 ### Changed
 
@@ -1215,6 +1222,11 @@ Repo Avatar
 - **changelog:** Update changelog [skip ci]
 - **changelog:** Update changelog [skip ci]
 - **contract:** Add Soroban invariant tests for get_fee_withdrawal_nonce
+- **changelog:** Update changelog [skip ci]
+- **changelog:** Update changelog [skip ci]
+- **contract:** Add stateful property-based escrow solvency harness
+- **changelog:** Update changelog [skip ci]
+- **deps:** Bump proptest
 - **changelog:** Update changelog [skip ci]
 
 ### Deprecated
