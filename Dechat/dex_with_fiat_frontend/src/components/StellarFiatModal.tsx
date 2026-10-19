@@ -48,6 +48,16 @@ import {
   STELLAR_FIAT_RISK_CONFIRMATION_PHRASE,
   validateStellarFiatModalForm,
 } from '@/lib/stellarFiatModalSchema';
+import WithdrawalQueueStatus from './WithdrawalQueueStatus';
+import {
+  QuoteSnapshot,
+  BalanceSnapshot,
+  createQuoteSnapshot,
+  createBalanceSnapshot,
+  revalidateFormInputs,
+} from '@/lib/transactionFormProtection';
+import * as protectionModule from '@/lib/transactionFormProtection';
+import * as stellarContractModule from '@/lib/stellarContract';
 
 interface StellarFiatModalProps {
   isOpen: boolean;
@@ -129,6 +139,34 @@ export default function StellarFiatModal({
   const [lastActionTimestamp, setLastActionTimestamp] = useState(0);
   const [showTwoFactorModal, setShowTwoFactorModal] = useState(false);
   const [twoFactorConfirmation, setTwoFactorConfirmation] = useState('');
+  const [quoteSnapshot, setQuoteSnapshot] = useState<QuoteSnapshot | null>(null);
+  const [balanceSnapshot, setBalanceSnapshot] = useState<BalanceSnapshot | null>(null);
+  const [reconfirmationNotice, setReconfirmationNotice] = useState<string | null>(null);
+  const [hasConfirmedUpdatedValues, setHasConfirmedUpdatedValues] = useState(false);
+
+  useEffect(() => {
+    const addr = connection.address || connection.publicKey;
+    if (addr) {
+      try {
+        const fetchBalanceFn = (
+          stellarContractModule as Record<string, unknown>
+        ).fetchXlmBalance as ((pk: string) => Promise<string>) | undefined;
+
+        if (typeof fetchBalanceFn === 'function') {
+          const p = fetchBalanceFn(addr);
+          if (p && typeof p.then === 'function') {
+            void p
+              .then((bal) => {
+                setBalanceSnapshot(createBalanceSnapshot(bal || '0.00', addr));
+              })
+              .catch(() => {});
+          }
+        }
+      } catch {
+        // Mock does not export fetchXlmBalance in specific unit tests
+      }
+    }
+  }, [connection.address, connection.publicKey]);
 
   // Helpers avoid JSX branch narrowing (pending/loading render a separate view).
   const isStatusPending = (status as TxStatus) === 'pending';
@@ -147,6 +185,8 @@ export default function StellarFiatModal({
   const handlePreset = (value: number) => {
     setAmount(String(value));
     setActivePreset(value);
+    setReconfirmationNotice(null);
+    setHasConfirmedUpdatedValues(false);
   };
   const isMounted = useRef(true);
 
@@ -370,6 +410,13 @@ export default function StellarFiatModal({
       try {
         const quote = await getTokenPriceWithStatus('XLM', fiatCurrency);
         if (!cancelled) {
+          const snapshot = createQuoteSnapshot(
+            quote.price,
+            'XLM',
+            fiatCurrency,
+            quote.source,
+          );
+          setQuoteSnapshot(snapshot);
           setFiatEstimate(
             formatFiatAmount(xlm * quote.price, fiatCurrency),
           );
@@ -611,6 +658,37 @@ export default function StellarFiatModal({
 
     if (status === 'loading' || isTxProcessing) {
       return;
+    }
+
+    // Protect transaction forms from stale quotes and balances (#62)
+    if (!hasConfirmedUpdatedValues && !shouldBypass) {
+      const revalidation = await protectionModule.revalidateFormInputs({
+        quoteSnapshot,
+        balanceSnapshot,
+        currentAmountXlm: amount,
+        walletAddress: connection.address || connection.publicKey,
+        fiatCurrency,
+      });
+
+      if (!revalidation.valid) {
+        if (revalidation.latestQuote) {
+          setQuoteSnapshot(revalidation.latestQuote);
+          const xlm = parseFloat(amount);
+          if (xlm > 0) {
+            setFiatEstimate(
+              formatFiatAmount(xlm * revalidation.latestQuote.price, fiatCurrency),
+            );
+          }
+        }
+        if (revalidation.latestBalance) {
+          setBalanceSnapshot(revalidation.latestBalance);
+        }
+        setReconfirmationNotice(
+          revalidation.explanation ||
+            'Critical values changed while reviewing. Please reconfirm to proceed.',
+        );
+        return;
+      }
     }
 
     const now = Date.now();
@@ -1261,6 +1339,45 @@ export default function StellarFiatModal({
               >
                 <AlertCircle className="w-4 h-4 flex-shrink-0" />
                 <span>{errorMsg}</span>
+              </div>
+            )}
+
+            {isAdminMode && (
+              <div className="mb-4">
+                <WithdrawalQueueStatus />
+              </div>
+            )}
+
+            {reconfirmationNotice && (
+              <div
+                data-testid="reconfirmation-notice"
+                className="bg-amber-950/40 border border-amber-500/50 rounded-xl p-3 mb-4 text-xs text-amber-200"
+              >
+                <div className="flex items-center gap-2 font-semibold text-amber-300 mb-1">
+                  <AlertCircle className="w-4 h-4 shrink-0" />
+                  <span>Review Updated Values</span>
+                </div>
+                <p className="mb-2 leading-relaxed">{reconfirmationNotice}</p>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setHasConfirmedUpdatedValues(true);
+                      setReconfirmationNotice(null);
+                      void handleAction(true);
+                    }}
+                    className="theme-primary-button px-3 py-1.5 rounded-lg text-xs font-semibold"
+                  >
+                    Confirm Updated Values
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setReconfirmationNotice(null)}
+                    className="theme-border border px-3 py-1.5 rounded-lg text-xs text-gray-400 hover:text-white"
+                  >
+                    Dismiss
+                  </button>
+                </div>
               </div>
             )}
 

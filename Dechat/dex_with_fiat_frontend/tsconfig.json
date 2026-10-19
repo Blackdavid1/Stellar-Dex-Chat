@@ -15,7 +15,7 @@
     "moduleResolution": "bundler",
     "types": [
       "node",
-      "vitest/globals"
+      "vitest/globals",
       "vitest"
     ],
     "resolveJsonModule": true,

@@ -167,6 +167,32 @@ jobs:
             exit 1
           fi
 
+      - name: Validate ABI bindings match contract interface
+        run: |
+          set -euo pipefail
+          node -e '
+            const fs = require("fs");
+            const abiFile = "../dex_with_fiat_frontend/src/contracts/abi/fiat_bridge_abi.json";
+            if (!fs.existsSync(abiFile)) {
+              console.error("Error: contract ABI fixture missing at " + abiFile);
+              process.exit(1);
+            }
+            const abi = JSON.parse(fs.readFileSync(abiFile, "utf8"));
+            const rustSource = fs.readFileSync("src/lib.rs", "utf8");
+            const missing = [];
+            for (const method of abi.methods) {
+              const regex = new RegExp("pub\\\\s+fn\\\\s+" + method.name + "\\\\b");
+              if (!regex.test(rustSource)) {
+                missing.push(method.name);
+              }
+            }
+            if (missing.length > 0) {
+              console.error("Error: ABI artifact differs from contract build! Missing in contract:", missing);
+              process.exit(1);
+            }
+            console.log("Contract ABI verified successfully against contract build.");
+          '
+
   deny:
     name: License & Advisory Check
     runs-on: ubuntu-latest

@@ -16,6 +16,7 @@ import {
   assertWriteNetworkPinning,
 } from '@/lib/resilientRpc';
 
+export { mapContractError } from '@/contracts';
 export { stroopsToXlm as stroopsToDisplay } from '@/lib/stroops';
 
 const RPC_URL =
@@ -60,6 +61,13 @@ export interface FeeEstimate {
 
 const server = new rpc.Server(RPC_URL, { allowHttp: false });
 
+export const fiatBridgeClient = new FiatBridgeContractClient({
+  contractId: CONTRACT_ID,
+  rpcUrl: RPC_URL,
+  networkPassphrase: NETWORK_PASSPHRASE,
+  dummySourceAccount: DUMMY_SOURCE,
+});
+
 const HORIZON_URL =
   process.env.NEXT_PUBLIC_STELLAR_HORIZON_URL ||
   (RPC_URL.includes('testnet')
@@ -94,6 +102,7 @@ export function setCachedValue(key: string, value: unknown) {
 
 export function clearCache() {
   cache.clear();
+  fiatBridgeClient.clearCache();
   console.log('cache cleared');
 }
 
@@ -145,7 +154,10 @@ async function buildAndSimulate(
 
   const sim = await server.simulateTransaction(tx);
   if (rpc.Api.isSimulationError(sim)) {
-    throw new Error(`Simulation failed: ${sim.error}`);
+    const mapped = mapContractError(sim.error);
+    throw new Error(
+      `Simulation failed [${mapped.name} #${mapped.code}]: ${mapped.message}`,
+    );
   }
 
   let feeEstimate: FeeEstimate | null = null;
@@ -228,12 +240,7 @@ export async function simulateDeposit(
   amount: bigint,
 ): Promise<FeeEstimate | null> {
   await validateBridgeAmountLimit(amount);
-  const contract = new Contract(CONTRACT_ID);
-  const op = contract.call(
-    'deposit',
-    new Address(publicKey).toScVal(),
-    nativeToScVal(amount, { type: 'i128' }),
-  );
+  const op = fiatBridgeClient.buildDepositOperation(publicKey, amount);
   const { feeEstimate } = await buildAndSimulate(publicKey, op);
   return feeEstimate;
 }
@@ -251,12 +258,7 @@ export async function simulateWithdraw(
   recipientPublicKey: string,
   amount: bigint,
 ): Promise<FeeEstimate | null> {
-  const contract = new Contract(CONTRACT_ID);
-  const op = contract.call(
-    'withdraw',
-    new Address(recipientPublicKey).toScVal(),
-    nativeToScVal(amount, { type: 'i128' }),
-  );
+  const op = fiatBridgeClient.buildWithdrawOperation(recipientPublicKey, amount);
   const { feeEstimate } = await buildAndSimulate(adminPublicKey, op);
   return feeEstimate;
 }
@@ -343,12 +345,7 @@ export async function depositToContract(
 ): Promise<string> {
   assertWriteNetworkPinning('TESTNET', 'TESTNET');
   await validateBridgeAmountLimit(amount);
-  const contract = new Contract(CONTRACT_ID);
-  const op = contract.call(
-    'deposit',
-    new Address(publicKey).toScVal(),
-    nativeToScVal(amount, { type: 'i128' }),
-  );
+  const op = fiatBridgeClient.buildDepositOperation(publicKey, amount);
   const { assembledXdr } = await buildAndSimulate(publicKey, op);
   const signed = await signTx(assembledXdr);
   const hash = await submitAndWait(signed, onHashKnown);
@@ -425,7 +422,11 @@ async function viewCall<T>(functionName: string): Promise<T> {
 
 /** Returns the current token balance (in stroops) held by the bridge contract. */
 export async function getContractBalance(): Promise<bigint> {
-  return viewCall<bigint>('get_balance');
+  const cached = getCachedValue<bigint>('get_balance');
+  if (cached !== undefined) return cached;
+  const val = await fiatBridgeClient.getBalance();
+  setCachedValue('get_balance', val);
+  return val;
 }
 
 /**
@@ -441,12 +442,20 @@ export async function getContractBalance(): Promise<bigint> {
  * routing and UI states accurately reflect the source of truth.
  */
 export async function getAdmin(): Promise<string> {
-  return viewCall<string>('get_admin');
+  const cached = getCachedValue<string>('get_admin');
+  if (cached !== undefined) return cached;
+  const val = await fiatBridgeClient.getAdmin();
+  setCachedValue('get_admin', val);
+  return val;
 }
 
 /** Returns the per-deposit limit set by the admin. */
 export async function getBridgeLimit(): Promise<bigint> {
-  return viewCall<bigint>('get_limit');
+  const cached = getCachedValue<bigint>('get_limit');
+  if (cached !== undefined) return cached;
+  const val = await fiatBridgeClient.getLimit();
+  setCachedValue('get_limit', val);
+  return val;
 }
 
 /**
@@ -474,12 +483,19 @@ export async function validateBridgeAmountLimit(
 
 /** Returns the running total of all deposits ever made. */
 export async function getTotalDeposited(): Promise<bigint> {
-  return viewCall<bigint>('get_total_deposited');
+  const cached = getCachedValue<bigint>('get_total_deposited');
+  if (cached !== undefined) return cached;
+  const val = await fiatBridgeClient.getTotalDeposited();
+  setCachedValue('get_total_deposited', val);
+  return val;
 }
 
 export async function getWithdrawalQueueDepth(): Promise<number> {
-  const value = await viewCall<bigint | number>('get_wq_depth');
-  return Number(value);
+  const cached = getCachedValue<number>('get_wq_depth');
+  if (cached !== undefined) return cached;
+  const val = await fiatBridgeClient.getWithdrawalQueueDepth();
+  setCachedValue('get_wq_depth', val);
+  return val;
 }
 
 /** Returns the accrued fees for the specified token. */
@@ -491,35 +507,9 @@ export async function getAccruedFees(tokenAddress: string): Promise<bigint> {
     return cached;
   }
 
-  const contract = new Contract(CONTRACT_ID);
-  let account;
-  try {
-    account = await server.getAccount(DUMMY_SOURCE);
-  } catch {
-    const { Account } = await import('@stellar/stellar-sdk');
-    account = new Account(DUMMY_SOURCE, '0');
-  }
-
-  const tx = new TransactionBuilder(account, {
-    fee: BASE_FEE,
-    networkPassphrase: NETWORK_PASSPHRASE,
-  })
-    .addOperation(
-      contract.call('get_accrued_fees', new Address(tokenAddress).toScVal()),
-    )
-    .setTimeout(30)
-    .build();
-
-  const sim = await server.simulateTransaction(tx);
-  if (rpc.Api.isSimulationError(sim)) {
-    throw new Error(`View call failed: ${sim.error}`);
-  }
-  const retval = (sim as rpc.Api.SimulateTransactionSuccessResponse).result
-    ?.retval;
-  if (!retval) throw new Error('No return value');
-  const result = scValToNative(retval) as bigint;
-  setCachedValue(functionName, result);
-  return result;
+  const val = await fiatBridgeClient.getAccruedFees(tokenAddress);
+  setCachedValue(functionName, val);
+  return val;
 }
 
 /** Fetches the native XLM balance for the given public key. Returns empty string on failure. */
