@@ -32,6 +32,15 @@ import { useAccessibleModal } from '@/hooks/useAccessibleModal';
 import { useIdempotentAction } from '@/hooks/useIdempotentAction';
 import { getOrCreateClientSessionId } from '@/lib/clientSession';
 import { chatTelemetry } from '@/lib/chatTelemetry';
+import { StellarWalletContext } from '@/contexts/StellarWalletContext';
+import { useCrossTabPayoutCoordination } from '@/hooks/useCrossTabPayoutCoordination';
+import {
+  createInitialTransferState,
+  reconcileTransferStatus,
+  loadResumableTransfer,
+  saveResumableTransfer,
+  type ResumableTransferState,
+} from '@/lib/transferStatusReconciler';
 import { z } from 'zod';
 
 /** ISO 13616 MOD-97 check used by the IBAN standard. */
@@ -230,6 +239,24 @@ export default function BankDetailsModal({
   const [payoutError, setPayoutError] = useState('');
   const [payoutNote, setPayoutNote] = useState('');
 
+  // Stellar Wallet Context (defensive fallback when not wrapped in provider)
+  const walletContext = React.useContext(StellarWalletContext);
+  const activeAddress = walletContext?.connection?.address || '';
+  const isWalletConnected = walletContext?.connection?.isConnected ?? true;
+  const isWalletSessionExpired = walletContext?.sessionExpired ?? false;
+  const walletReconnect = walletContext?.reconnect;
+
+  // Cross-tab coordination
+  const {
+    activeIntent,
+    isBlockedByAnotherTab,
+    acquireIntent,
+    releaseIntent,
+  } = useCrossTabPayoutCoordination(activeAddress);
+
+  // Resumable linked transfer timeline state
+  const [timelineState, setTimelineState] = useState<ResumableTransferState | null>(null);
+
   // Step 4 — success & status tracking
   const [transferReference, setTransferReference] = useState('');
   const [transferStatus, setTransferStatus] = useState<
@@ -247,6 +274,14 @@ export default function BankDetailsModal({
       { status, timestamp: new Date(), label },
     ]);
   };
+
+  useEffect(() => {
+    if (!transferReference) return;
+    const existing = loadResumableTransfer(transferReference);
+    if (existing) {
+      setTimelineState(existing);
+    }
+  }, [transferReference]);
 
   const wasOpenRef = useRef(false);
   useEffect(() => {
@@ -345,6 +380,22 @@ export default function BankDetailsModal({
             if (status === 'success') {
               setIsPollingStatus(false);
               pushStatusEvent('success', 'Bank transfer confirmed');
+              setTimelineState((prev) => {
+                const base =
+                  prev || createInitialTransferState(transferReference);
+                const next = reconcileTransferStatus(base, {
+                  stage: 'provider',
+                  status: 'success',
+                  source: 'polling',
+                  label: 'Bank transfer confirmed',
+                  timestamp: new Date(),
+                });
+                saveResumableTransfer(next);
+                return next;
+              });
+              if (activeIntent) {
+                releaseIntent(activeIntent.intentKey, 'completed');
+              }
               addNotificationRef.current(
                 'payout_success',
                 'Fiat payout successfully completed!',
@@ -355,6 +406,22 @@ export default function BankDetailsModal({
               const suffix = failureReason ? `: ${failureReason}` : '';
               setIsPollingStatus(false);
               setTransferFailureReason(failureReason ?? '');
+              setTimelineState((prev) => {
+                const base =
+                  prev || createInitialTransferState(transferReference);
+                const next = reconcileTransferStatus(base, {
+                  stage: 'provider',
+                  status: status,
+                  source: 'polling',
+                  label: `Transfer ${status}${suffix}`,
+                  timestamp: new Date(),
+                });
+                saveResumableTransfer(next);
+                return next;
+              });
+              if (activeIntent) {
+                releaseIntent(activeIntent.intentKey, 'failed');
+              }
               pushStatusEvent(status, `Transfer ${status}${suffix}`);
               addNotificationRef.current(
                 'payout_fail',
@@ -369,7 +436,7 @@ export default function BankDetailsModal({
     }, 5000);
 
     return () => clearInterval(pollInterval);
-  }, [step, transferReference, transferStatus]);
+  }, [step, transferReference, transferStatus, activeIntent, releaseIntent]);
 
   const filteredBanks = banks.filter((b) =>
     b.name.toLowerCase().includes(bankSearch.toLowerCase()),
@@ -469,9 +536,20 @@ export default function BankDetailsModal({
       !verifiedAccount ||
       !lockedQuote ||
       quoteSecondsLeft === 0 ||
-      isPayoutProcessing
+      isPayoutProcessing ||
+      isBlockedByAnotherTab
     )
       return;
+
+    // Check wallet session if StellarWalletContext is active
+    if (walletContext && (!isWalletConnected || isWalletSessionExpired)) {
+      setPayoutError(
+        isWalletSessionExpired
+          ? 'Wallet session has expired. Please reconnect to continue.'
+          : 'Wallet disconnected. Please reconnect to continue.',
+      );
+      return;
+    }
 
     const noteValidation = bankDetailsSchema
       .pick({ payoutNote: true })
@@ -482,6 +560,17 @@ export default function BankDetailsModal({
     }
 
     await executePayoutConfirm(async (idempotencyKey) => {
+      // 1. Cross-tab coordination: acquire intent key across tabs when activeAddress is present
+      if (activeAddress) {
+        const acquireResult = acquireIntent(idempotencyKey);
+        if (!acquireResult.acquired) {
+          setPayoutError(
+            'This payout is already being processed in another tab. Duplicate submission prevented.',
+          );
+          return;
+        }
+      }
+
       chatTelemetry.fiatPayoutStep({
         action: 'confirm_attempt',
         step: 3,
@@ -491,6 +580,19 @@ export default function BankDetailsModal({
       setPayoutError('');
       setStatusEvents([]);
       setTransferFailureReason('');
+
+      // Initialize linked resumable timeline
+      let currentTimeline = createInitialTransferState(idempotencyKey);
+      currentTimeline = reconcileTransferStatus(currentTimeline, {
+        stage: 'on_chain',
+        status: 'initiated',
+        source: 'on_chain',
+        label: 'Transfer initiated',
+        timestamp: new Date(),
+      });
+      setTimelineState(currentTimeline);
+      saveResumableTransfer(currentTimeline);
+
       pushStatusEvent('initiated', 'Transfer initiated');
       addNotification('payout_pending', 'Fiat payout request is pending...');
       try {
@@ -519,6 +621,23 @@ export default function BankDetailsModal({
             recipientJson.message ?? 'Failed to create transfer recipient',
           );
         }
+
+        currentTimeline = reconcileTransferStatus(currentTimeline, {
+          stage: 'on_chain',
+          status: 'confirmed',
+          source: 'on_chain',
+          label: 'Deposit confirmed on blockchain',
+          timestamp: new Date(),
+        });
+        currentTimeline = reconcileTransferStatus(currentTimeline, {
+          stage: 'provider',
+          status: 'pending',
+          source: 'provider',
+          label: 'Submitted to bank — awaiting confirmation',
+          timestamp: new Date(),
+        });
+        setTimelineState(currentTimeline);
+        saveResumableTransfer(currentTimeline);
 
         pushStatusEvent('pending', 'Submitted to bank — awaiting confirmation');
         setIsPollingStatus(true);
@@ -552,9 +671,15 @@ export default function BankDetailsModal({
           );
         }
 
-        setTransferReference(
-          transferJson.data.reference || transferJson.data.transfer_code || '',
-        );
+        const ref =
+          transferJson.data.reference || transferJson.data.transfer_code || '';
+        setTransferReference(ref);
+        if (ref && ref !== idempotencyKey) {
+          currentTimeline = { ...currentTimeline, transferReference: ref };
+          setTimelineState(currentTimeline);
+          saveResumableTransfer(currentTimeline);
+        }
+
         addEntry({
           kind: 'payout',
           status: 'pending',
@@ -566,10 +691,7 @@ export default function BankDetailsModal({
           }),
           fiatCurrency: 'NGN',
           note: payoutNote.trim() || undefined,
-          reference:
-            transferJson.data.reference ||
-            transferJson.data.transfer_code ||
-            '',
+          reference: ref,
           message: `Fiat payout initiated to ${selectedBank.name}.`,
         });
         // Move to the status step while the transfer is still pending — the
@@ -582,6 +704,9 @@ export default function BankDetailsModal({
           xlmAmount,
         });
       } catch (err) {
+        if (activeAddress) {
+          releaseIntent(idempotencyKey, 'failed');
+        }
         const errorMsg =
           err instanceof Error
             ? err.message
@@ -594,6 +719,15 @@ export default function BankDetailsModal({
         });
         setPayoutError(errorMsg);
         setIsPollingStatus(false);
+        currentTimeline = reconcileTransferStatus(currentTimeline, {
+          stage: 'provider',
+          status: 'failed',
+          source: 'provider',
+          label: `Transfer failed: ${errorMsg}`,
+          timestamp: new Date(),
+        });
+        setTimelineState(currentTimeline);
+        saveResumableTransfer(currentTimeline);
         pushStatusEvent('failed', `Transfer failed: ${errorMsg}`);
         addNotification('payout_fail', `Payout failed: ${errorMsg}`);
       } finally {
@@ -1321,6 +1455,79 @@ export default function BankDetailsModal({
                   </motion.div>
                 )}
 
+                {isBlockedByAnotherTab && (
+                  <motion.div
+                    initial={{ opacity: 0, scale: 0.95 }}
+                    animate={{ opacity: 1, scale: 1 }}
+                    exit={{ opacity: 0, scale: 0.95 }}
+                    data-testid="cross-tab-warning"
+                    className="theme-soft-warning flex items-center gap-2 text-sm mb-4 rounded-lg px-3 py-2 border border-amber-500/40"
+                  >
+                    <AlertCircle className="w-4 h-4 flex-shrink-0 text-amber-400" />
+                    <span className="text-amber-200 text-xs">
+                      A payout intent for this account is already active in another browser tab. Please complete or close that tab before initiating a new one.
+                    </span>
+                  </motion.div>
+                )}
+
+                {walletContext && isWalletSessionExpired && (
+                  <motion.div
+                    initial={{ opacity: 0, y: -10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -10 }}
+                    data-testid="wallet-session-expired-banner"
+                    className="theme-soft-warning mb-4 rounded-xl border border-amber-500/40 px-4 py-3 flex items-center justify-between gap-3"
+                  >
+                    <div>
+                      <p className="font-semibold text-xs text-amber-300">
+                        Wallet Session Expired
+                      </p>
+                      <p className="text-[11px] text-amber-200/80">
+                        Your payout details have been preserved. Re-authenticate to proceed.
+                      </p>
+                    </div>
+                    {walletReconnect && (
+                      <button
+                        type="button"
+                        data-testid="reconnect-button"
+                        onClick={() => void walletReconnect()}
+                        className="px-3 py-1.5 bg-amber-500 hover:bg-amber-400 text-black text-xs font-semibold rounded-lg transition-colors flex-shrink-0"
+                      >
+                        Reconnect
+                      </button>
+                    )}
+                  </motion.div>
+                )}
+
+                {walletContext && !isWalletConnected && !isWalletSessionExpired && (
+                  <motion.div
+                    initial={{ opacity: 0, y: -10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -10 }}
+                    data-testid="wallet-disconnected-banner"
+                    className="theme-soft-warning mb-4 rounded-xl border border-blue-500/40 px-4 py-3 flex items-center justify-between gap-3"
+                  >
+                    <div>
+                      <p className="font-semibold text-xs text-blue-300">
+                        Wallet Disconnected
+                      </p>
+                      <p className="text-[11px] text-blue-200/80">
+                        Connect your wallet to confirm this payout.
+                      </p>
+                    </div>
+                    {walletReconnect && (
+                      <button
+                        type="button"
+                        data-testid="connect-wallet-button"
+                        onClick={() => void walletReconnect()}
+                        className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold rounded-lg transition-colors flex-shrink-0"
+                      >
+                        Connect
+                      </button>
+                    )}
+                  </motion.div>
+                )}
+
                 {payoutError && (
                   <motion.div
                     initial={{ opacity: 0, scale: 0.95 }}
@@ -1350,7 +1557,10 @@ export default function BankDetailsModal({
                       isPayoutProcessing ||
                       quoteLoading ||
                       !lockedQuote ||
-                      quoteSecondsLeft === 0
+                      quoteSecondsLeft === 0 ||
+                      isBlockedByAnotherTab ||
+                      (Boolean(walletContext) &&
+                        (!isWalletConnected || isWalletSessionExpired))
                     }
                     className="theme-primary-button flex-1 flex items-center justify-center gap-2 disabled:bg-blue-800 disabled:opacity-70 text-white py-3 rounded-lg font-medium transition-colors"
                   >
@@ -1366,7 +1576,7 @@ export default function BankDetailsModal({
                 </div>
 
                 {/* Payout Status Timeline — visible while processing */}
-                {statusEvents.length > 0 && (
+                {(statusEvents.length > 0 || timelineState) && (
                   <motion.div
                     initial={{ opacity: 0, y: 20 }}
                     animate={{ opacity: 1, y: 0 }}
@@ -1377,6 +1587,7 @@ export default function BankDetailsModal({
                       Transfer Status
                     </p>
                     <TransferTimeline
+                      state={timelineState ?? undefined}
                       events={statusEvents.map((event) => ({
                         ...event,
                         copyValue: transferReference || undefined,
@@ -1466,7 +1677,7 @@ export default function BankDetailsModal({
                 )}
 
                 {/* Timeline showing all status transitions */}
-                {statusEvents.length > 0 && (
+                {(statusEvents.length > 0 || timelineState) && (
                   <motion.div
                     initial={{ opacity: 0, y: 20 }}
                     animate={{ opacity: 1, y: 0 }}
@@ -1477,6 +1688,7 @@ export default function BankDetailsModal({
                       Transfer History
                     </p>
                     <TransferTimeline
+                      state={timelineState ?? undefined}
                       events={statusEvents.map((event) => ({
                         ...event,
                         copyValue: transferReference || undefined,
@@ -1504,6 +1716,26 @@ export default function BankDetailsModal({
                                 'cancelled',
                                 'Transfer cancelled',
                               );
+                              setTimelineState((prev) => {
+                                const base =
+                                  prev ||
+                                  createInitialTransferState(transferReference);
+                                const next = reconcileTransferStatus(base, {
+                                  stage: 'provider',
+                                  status: 'cancelled',
+                                  source: 'provider',
+                                  label: 'Transfer cancelled',
+                                  timestamp: new Date(),
+                                });
+                                saveResumableTransfer(next);
+                                return next;
+                              });
+                              if (activeIntent) {
+                                releaseIntent(
+                                  activeIntent.intentKey,
+                                  'failed',
+                                );
+                              }
                               addNotification(
                                 'payout_cancelled',
                                 'Payout was cancelled successfully.',

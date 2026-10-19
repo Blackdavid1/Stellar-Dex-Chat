@@ -11,6 +11,10 @@ import {
 } from '@stellar/stellar-sdk';
 import { stroopsToXlm } from '@/lib/stroops';
 import { clientEnv as env } from '@/lib/clientEnv';
+import {
+  withResilientRpcRead,
+  assertWriteNetworkPinning,
+} from '@/lib/resilientRpc';
 
 export { stroopsToXlm as stroopsToDisplay } from '@/lib/stroops';
 
@@ -337,6 +341,7 @@ export async function depositToContract(
   signTx: (xdr: string) => Promise<string>,
   onHashKnown?: (hash: string) => void,
 ): Promise<string> {
+  assertWriteNetworkPinning('TESTNET', 'TESTNET');
   await validateBridgeAmountLimit(amount);
   const contract = new Contract(CONTRACT_ID);
   const op = contract.call(
@@ -362,6 +367,7 @@ export async function withdrawFromContract(
   signTx: (xdr: string) => Promise<string>,
   onHashKnown?: (hash: string) => void,
 ): Promise<string> {
+  assertWriteNetworkPinning('TESTNET', 'TESTNET');
   const contract = new Contract(CONTRACT_ID);
   const op = contract.call(
     'withdraw',
@@ -384,37 +390,37 @@ async function viewCall<T>(functionName: string): Promise<T> {
   if (cached !== undefined) {
     return cached;
   }
-  // Use a dummy account (Stellar Foundation's well-known testnet account) for cls
-  const contract = new Contract(CONTRACT_ID);
 
-  // We don't need a funded account — just a valid one for building the tx
-  let account;
-  try {
-    account = await server.getAccount(DUMMY_SOURCE);
-  } catch {
-    // If testnet doesn't know the account, create a skeleton account object
-    const { Account } = await import('@stellar/stellar-sdk');
-    account = new Account(DUMMY_SOURCE, '0');
-  }
+  return withResilientRpcRead('TESTNET', async (activeServer) => {
+    const contract = new Contract(CONTRACT_ID);
 
-  const tx = new TransactionBuilder(account, {
-    fee: BASE_FEE,
-    networkPassphrase: NETWORK_PASSPHRASE,
-  })
-    .addOperation(contract.call(functionName))
-    .setTimeout(30)
-    .build();
+    let account;
+    try {
+      account = await activeServer.getAccount(DUMMY_SOURCE);
+    } catch {
+      const { Account } = await import('@stellar/stellar-sdk');
+      account = new Account(DUMMY_SOURCE, '0');
+    }
 
-  const sim = await server.simulateTransaction(tx);
-  if (rpc.Api.isSimulationError(sim)) {
-    throw new Error(`View call failed: ${sim.error}`);
-  }
-  const retval = (sim as rpc.Api.SimulateTransactionSuccessResponse).result
-    ?.retval;
-  if (!retval) throw new Error('No return value');
-  const result = scValToNative(retval) as T;
-  setCachedValue(functionName, result);
-  return result;
+    const tx = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: NETWORK_PASSPHRASE,
+    })
+      .addOperation(contract.call(functionName))
+      .setTimeout(30)
+      .build();
+
+    const sim = await activeServer.simulateTransaction(tx);
+    if (rpc.Api.isSimulationError(sim)) {
+      throw new Error(`View call failed: ${sim.error}`);
+    }
+    const retval = (sim as rpc.Api.SimulateTransactionSuccessResponse).result
+      ?.retval;
+    if (!retval) throw new Error('No return value');
+    const result = scValToNative(retval) as T;
+    setCachedValue(functionName, result);
+    return result;
+  });
 }
 
 /** Returns the current token balance (in stroops) held by the bridge contract. */
