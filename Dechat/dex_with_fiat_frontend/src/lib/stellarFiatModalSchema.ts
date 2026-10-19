@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { parseAssetAmount } from './exactAmount';
 
 /** Must match typed confirmation in `StellarFiatModal` for large transfers. */
 export const STELLAR_FIAT_RISK_CONFIRMATION_PHRASE = 'CONFIRM LARGE AMOUNT';
@@ -10,10 +11,22 @@ const amountStringSchema = z
   .string()
   .trim()
   .min(1, 'Enter an amount')
-  .refine((s) => {
-    const n = Number.parseFloat(s);
-    return Number.isFinite(n) && n > 0;
-  }, 'Amount must be a positive number');
+  .superRefine((s, ctx) => {
+    const res = parseAssetAmount(s);
+    if (!res.success) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: res.error,
+      });
+      return;
+    }
+    if (res.stroops <= 0n) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'Amount must be greater than zero',
+      });
+    }
+  });
 
 const noteSchema = z.string().max(160, 'Note must be at most 160 characters');
 

@@ -1,33 +1,37 @@
 import { NextRequest, NextResponse } from 'next/server';
+import crypto from 'crypto';
 import * as Sentry from '@sentry/nextjs';
 import { getPayoutProvider } from '@/lib/payout/providers/registry';
 import { telemetry } from '@/lib/telemetry';
 import { applyRateLimit, getClientIp } from '@/lib/rateLimit';
 import { setTransferStatus } from '@/lib/transferStore';
 import { initiateTransferSchema } from '@/lib/apiSchemas';
+import { payoutAuditLedger } from '@/lib/payout/auditLedger';
+import { payoutRetryQueue } from '@/lib/payout/retryQueue';
 
 const RATE_LIMIT = { maxRequests: 3, windowMs: 60_000 };
 
-const idempotencyCache = new Map<string, { result: unknown; timestamp: number }>();
+const idempotencyCache = new Map<
+  string,
+  { result: unknown; timestamp: number }
+>();
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
 
+export async function OPTIONS(request: NextRequest) {
+  return (
+    enforcePayoutRouteSecurity(request) ||
+    new NextResponse(null, { status: 204 })
+  );
+}
+
 export async function POST(request: NextRequest) {
+  // Enforce payout API security
+  const securityBlocked = enforcePayoutRouteSecurity(request);
+  if (securityBlocked) return securityBlocked;
+
   const ip = getClientIp(request);
   const limited = applyRateLimit(ip, '/api/initiate-transfer', RATE_LIMIT);
   if (limited) return limited;
-
-  const idempotencyKey = request.headers.get('X-Idempotency-Key');
-  if (!idempotencyKey) {
-    return NextResponse.json(
-      { success: false, message: 'X-Idempotency-Key header is required' },
-      { status: 400 },
-    );
-  }
-
-  const cached = idempotencyCache.get(idempotencyKey);
-  if (cached && Date.now() - cached.timestamp < IDEMPOTENCY_TTL_MS) {
-    return NextResponse.json({ success: true, data: cached.result });
-  }
 
   const traceContext = telemetry.extractTraceFromHeaders(request.headers);
   const span = telemetry.createSpan(
@@ -79,52 +83,146 @@ export async function POST(request: NextRequest) {
     }
 
     const { source, reason, amount, recipient } = validationResult.data;
-    // `clientSessionId` isn't part of initiateTransferSchema, so it's read
-    // from the raw (already-validated-as-an-object) body instead of
-    // validationResult.data.
     const bodyRecord = body as Record<string, unknown>;
     const clientSessionId =
       typeof bodyRecord.clientSessionId === 'string'
         ? bodyRecord.clientSessionId
         : undefined;
 
+    // Idempotency key from header, body reference, or generated fallback
+    const headerIdempotencyKey = request.headers.get('X-Idempotency-Key');
+    const idempotencyKey =
+      headerIdempotencyKey ||
+      (typeof bodyRecord.reference === 'string' && bodyRecord.reference
+        ? bodyRecord.reference
+        : null) ||
+      `idem_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+
+    const cached = idempotencyCache.get(idempotencyKey);
+    if (cached && Date.now() - cached.timestamp < IDEMPOTENCY_TTL_MS) {
+      return NextResponse.json({ success: true, data: cached.result });
+    }
+
     telemetry.addLog(span.spanId, 'info', 'Request validated', {
       hasSource: !!source,
       hasAmount: !!amount,
       hasRecipient: !!recipient,
       amount: amount,
+      idempotencyKey,
+    });
+
+    // Record immutable audit event for payout initiation (Issue #38)
+    payoutAuditLedger.recordEvent({
+      payoutId: idempotencyKey,
+      action: 'payout_initiated',
+      actor: clientSessionId ? `client:${clientSessionId}` : 'client:user',
+      requestCorrelationId: traceContext.traceId,
+      providerReference: idempotencyKey,
+      metadata: {
+        source,
+        reason,
+        amount: Number(amount),
+        recipient,
+      },
     });
 
     const provider = getPayoutProvider();
-    const data = await provider.initiateTransfer({
-      source,
-      reason,
-      amount,
-      recipient,
-      reference: idempotencyKey,
-    });
 
-    const transferReference =
-      typeof data.reference === 'string' && data.reference
-        ? data.reference
-        : idempotencyKey;
+    try {
+      const data = await provider.initiateTransfer({
+        source,
+        reason,
+        amount: Number(amount),
+        recipient,
+        reference: idempotencyKey,
+      });
 
-    if (transferReference) {
+      const transferReference =
+        typeof data.reference === 'string' && data.reference
+          ? data.reference
+          : idempotencyKey;
+
+      if (transferReference) {
+        setTransferStatus({
+          reference: transferReference,
+          status: 'pending',
+          amount: Number(amount),
+          updatedAt: new Date().toISOString(),
+          clientSessionId,
+        });
+      }
+
+      // Record successful provider acceptance in audit ledger
+      payoutAuditLedger.recordEvent({
+        payoutId: transferReference,
+        action: 'payout_provider_accepted',
+        actor: 'provider:paystack',
+        requestCorrelationId: traceContext.traceId,
+        providerReference: transferReference,
+        metadata: { data: data as Record<string, unknown> },
+      });
+
+      idempotencyCache.set(idempotencyKey, {
+        result: data,
+        timestamp: Date.now(),
+      });
+
+      return NextResponse.json({
+        success: true,
+        data,
+      });
+    } catch (providerError: unknown) {
+      const errorMessage =
+        providerError instanceof Error
+          ? providerError.message
+          : 'Unknown provider error';
+
+      // Enqueue into durable retry queue instead of losing payout intent (Issue #37)
+      const retryJob = payoutRetryQueue.enqueueJob({
+        payoutId: idempotencyKey,
+        idempotencyKey,
+        payload: {
+          source,
+          amount: Number(amount),
+          recipient,
+          reason,
+        },
+        error: errorMessage,
+        correlationId: traceContext.traceId,
+      });
+
       setTransferStatus({
-        reference: transferReference,
+        reference: idempotencyKey,
         status: 'pending',
         amount: Number(amount),
-        updatedAt: new Date().toISOString(),
+        updatedAt: new Date(now).toISOString(),
+        updatedAtMs: now,
         clientSessionId,
+        failureReason: `Transient error: ${errorMessage}. Queued for retry.`,
       });
+
+      telemetry.addLog(
+        span.spanId,
+        'warn',
+        'Provider call failed; enqueued into retry queue',
+        {
+          jobId: retryJob.id,
+          idempotencyKey,
+          error: errorMessage,
+        },
+      );
+
+      return NextResponse.json(
+        {
+          success: true,
+          status: 'queued_for_retry',
+          reference: idempotencyKey,
+          jobId: retryJob.id,
+          message: 'Transfer queued for retry due to provider failure',
+        },
+        { status: 202 },
+      );
     }
-
-    idempotencyCache.set(idempotencyKey, { result: data, timestamp: Date.now() });
-
-    return NextResponse.json({
-      success: true,
-      data,
-    });
   } catch (error: unknown) {
     Sentry.captureException(error, {
       tags: {
@@ -150,18 +248,19 @@ export async function POST(request: NextRequest) {
 
     console.error('Initiate transfer error:', error);
 
+    const errorDetails = handlePayoutApiError(
+      error,
+      'Failed to initiate transfer. Please try again.',
+    );
+
     telemetry.finishSpan(span.spanId, {
       success: false,
-      error: 'Failed to initiate transfer. Please try again.',
-      errorType: 'unknown_error',
+      error: errorDetails.body.message,
     });
 
-    return NextResponse.json(
-      {
-        success: false,
-        message: 'Failed to initiate transfer. Please try again.',
-      },
-      { status: 500 },
-    );
+    return NextResponse.json(errorDetails.body, {
+      status: errorDetails.status,
+      headers: errorDetails.headers,
+    });
   }
 }

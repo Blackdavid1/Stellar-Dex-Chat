@@ -165,3 +165,17 @@ export function stroopsToXlmOrNull(stroops: bigint | string): string | null {
  */
 export const stroopsToDisplay = stroopsToXlm;
 
+export {
+  parseAssetAmount,
+  formatAssetAmount,
+  validateAmountInput,
+  type TokenPrecisionMetadata,
+  type ParseAmountResult,
+  type ParseAmountSuccess,
+  type ParseAmountError,
+  type AmountErrorCode,
+  STELLAR_NATIVE_DECIMALS,
+  MAX_I128,
+  MAX_INT64,
+} from './exactAmount';
+

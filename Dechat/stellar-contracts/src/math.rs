@@ -204,6 +204,90 @@ pub fn scale_floor(amount: i128, numerator: i128, denominator: i128) -> i128 {
     mul_div_floor(amount, numerator, denominator)
 }
 
+/// Maximum number of decimal places supported by [`convert_token_to_fiat`].
+///
+/// Both `token_decimals` and `oracle_decimals` must be `<= MAX_DECIMALS`. This bound keeps
+/// the `10^decimals` scale factors well within `i128` range and guarantees that the
+/// intermediate product `amount * 10^token_decimals` cannot overflow for realistic amounts.
+pub const MAX_DECIMALS: u32 = 18;
+
+/// Convert a raw token `amount` into a fixed-point fiat value using an oracle price.
+///
+/// This is the single canonical conversion helper used by deposit and withdrawal
+/// validation so that every caller applies identical scaling, rounding and overflow
+/// semantics.
+///
+/// # Formula
+/// Let `token_scale = 10^token_decimals` and `oracle_scale = 10^oracle_decimals`.
+/// The result is the mathematical floor:
+/// $$\left\lfloor \frac{\text{amount} \times \text{oracle\_price} \times 10^{\text{oracle\_decimals}}}
+///   {10^{\text{token\_decimals}}} \right\rfloor$$
+///
+/// The returned value is expressed in the oracle's fixed-point scale
+/// (i.e. `oracle_scale` units per whole fiat unit), so a price of `1.0` with
+/// `oracle_decimals = 7` yields `10_000_000` per whole token unit.
+///
+/// # Rounding Direction
+/// Always rounds **down** (true mathematical floor). This is the specified direction
+/// for limit comparisons: flooring never overstates the fiat value of a deposit or
+/// withdrawal, so limit checks remain conservative.
+///
+/// # Overflow & Validation
+/// - `token_decimals` and `oracle_decimals` must each be `<= MAX_DECIMALS`; otherwise
+///   [`Error::Overflow`] is returned.
+/// - All multiplications use checked arithmetic via [`checked_mul_div_floor`]; any
+///   intermediate overflow returns [`Error::Overflow`].
+/// - A negative `amount` or `oracle_price` is rejected with [`Error::Overflow`].
+///
+/// # Arguments
+/// * `amount` – Raw token amount in base units.
+/// * `token_decimals` – Decimal places of the token (0..=`MAX_DECIMALS`).
+/// * `oracle_price` – Price scaled by `10^oracle_decimals`.
+/// * `oracle_decimals` – Decimal places of the oracle price (0..=`MAX_DECIMALS`).
+///
+/// # Returns
+/// * `Ok(i128)` – Floored fiat value in the oracle's fixed-point scale.
+/// * `Err(Error::Overflow)` – On invalid decimals, negative inputs, or arithmetic overflow.
+///
+/// # Examples
+/// ```
+/// use crate::math::convert_token_to_fiat;
+///
+/// // 1_000_000 units of a 6-decimal token at price 1.0 (7 oracle decimals)
+/// // = 1_000_000 * 10^7 / 10^6 = 10_000_000
+/// assert_eq!(convert_token_to_fiat(1_000_000, 6, 10_000_000, 7).unwrap(), 10_000_000);
+/// ```
+pub fn convert_token_to_fiat(
+    amount: i128,
+    token_decimals: u32,
+    oracle_price: i128,
+    oracle_decimals: u32,
+) -> Result<i128, Error> {
+    if token_decimals > MAX_DECIMALS || oracle_decimals > MAX_DECIMALS {
+        return Err(Error::Overflow);
+    }
+    if amount < 0 || oracle_price < 0 {
+        return Err(Error::Overflow);
+    }
+
+    // Scale the amount up to the oracle's fixed-point precision, then apply the
+    // price and floor-divide back down by the token scale. `checked_mul_div_floor`
+    // performs the checked `amount * price` multiplication and true floor division.
+    let token_scale = 10i128
+        .checked_pow(token_decimals)
+        .ok_or(Error::Overflow)?;
+    let oracle_scale = 10i128
+        .checked_pow(oracle_decimals)
+        .ok_or(Error::Overflow)?;
+
+    // amount * oracle_price * oracle_scale / token_scale, computed as
+    // (amount * oracle_price) * oracle_scale / token_scale with checked steps.
+    let scaled_price = oracle_price
+        .checked_mul(oracle_scale)
+        .ok_or(Error::Overflow)?;
+    checked_mul_div_floor(amount, scaled_price, token_scale)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,5 +398,90 @@ mod tests {
     fn mul_div_ceil_panics_on_overflow() {
         // Issue #966: ensure overflow is caught in ceil variant too
         mul_div_ceil(i128::MAX, 2, 1);
+    }
+
+    // ── convert_token_to_fiat ─────────────────────────────────────────────
+
+    #[test]
+    fn convert_zero_amount_is_zero() {
+        assert_eq!(convert_token_to_fiat(0, 6, FIXED_POINT, 7).unwrap(), 0);
+    }
+
+    #[test]
+    fn convert_unit_price_identity() {
+        // 1 whole 6-decimal token at price 1.0 (7 decimals) = 10^7
+        assert_eq!(
+            convert_token_to_fiat(1_000_000, 6, FIXED_POINT, 7).unwrap(),
+            FIXED_POINT
+        );
+    }
+
+    #[test]
+    fn convert_max_supported_decimals() {
+        // Both decimals at the maximum supported bound must not overflow.
+        let amount = 1_000_000_000i128;
+        let price = FIXED_POINT;
+        let result = convert_token_to_fiat(amount, MAX_DECIMALS, price, MAX_DECIMALS).unwrap();
+        // Equal decimals cancel out: result == amount * price / FIXED_POINT == amount
+        assert_eq!(result, amount);
+    }
+
+    #[test]
+    fn convert_rejects_decimals_above_max() {
+        assert_eq!(
+            convert_token_to_fiat(1, MAX_DECIMALS + 1, FIXED_POINT, 7),
+            Err(Error::Overflow)
+        );
+        assert_eq!(
+            convert_token_to_fiat(1, 6, FIXED_POINT, MAX_DECIMALS + 1),
+            Err(Error::Overflow)
+        );
+    }
+
+    #[test]
+    fn convert_rejects_negative_inputs() {
+        assert_eq!(
+            convert_token_to_fiat(-1, 6, FIXED_POINT, 7),
+            Err(Error::Overflow)
+        );
+        assert_eq!(
+            convert_token_to_fiat(1, 6, -FIXED_POINT, 7),
+            Err(Error::Overflow)
+        );
+    }
+
+    #[test]
+    fn convert_extreme_price_overflow_is_caught() {
+        // Huge price scaled by oracle_scale overflows the checked multiplication.
+        assert_eq!(
+            convert_token_to_fiat(1, 0, i128::MAX, 7),
+            Err(Error::Overflow)
+        );
+    }
+
+    #[test]
+    fn convert_rounds_down_for_limit_comparison() {
+        // 1 base unit of a 6-decimal token at price 1.0 (7 decimals)
+        // = 1 * 10^7 / 10^6 = 10 exactly.
+        assert_eq!(convert_token_to_fiat(1, 6, FIXED_POINT, 7).unwrap(), 10);
+        // 1 base unit at price 0.5 (7 decimals) = 5 exactly.
+        assert_eq!(convert_token_to_fiat(1, 6, FIXED_POINT / 2, 7).unwrap(), 5);
+        // 1 base unit at price 0.0000001 (7 decimals) = 0.0000001 -> floor -> 0.
+        assert_eq!(convert_token_to_fiat(1, 6, 1, 7).unwrap(), 0);
+    }
+
+    #[test]
+    fn convert_one_unit_either_side_of_limit() {
+        // Configured limit of 100 whole fiat units in 7-decimal fixed point.
+        let limit = 100 * FIXED_POINT;
+        // 99.9999999 whole tokens at unit price -> just below limit.
+        let below = convert_token_to_fiat(99_999_999, 6, FIXED_POINT, 7).unwrap();
+        assert!(below < limit);
+        // 100 whole tokens at unit price -> exactly at limit.
+        let at = convert_token_to_fiat(100_000_000, 6, FIXED_POINT, 7).unwrap();
+        assert_eq!(at, limit);
+        // 100.000001 whole tokens at unit price -> just above limit.
+        let above = convert_token_to_fiat(100_000_001, 6, FIXED_POINT, 7).unwrap();
+        assert!(above > limit);
     }
 }
