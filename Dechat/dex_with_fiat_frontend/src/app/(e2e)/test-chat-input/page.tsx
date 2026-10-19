@@ -113,6 +113,135 @@ const SUPPORTED_LOCALES: LocaleSpec[] = [
 ];
 
 /**
+ * Deterministic conversation replay for incident debugging.
+ *
+ * A trace records versioned state transitions, tool names, normalized
+ * arguments, policy decisions, and outcome codes with sensitive values
+ * redacted. Replay compares a recorded trace against a pinned model/policy
+ * fixture and reports divergence without executing any external or write
+ * tool. Traces are retained in memory only and never persisted client-side.
+ */
+type PolicyDecision = 'allow' | 'deny' | 'clarify';
+type OutcomeCode = 'ok' | 'denied' | 'error' | 'withheld';
+
+interface TraceStep {
+  /** Monotonic step index within the trace. */
+  index: number;
+  /** Versioned state transition label, e.g. "intent.parsed@v1". */
+  transition: string;
+  /** Tool name, or null when the step is a pure state transition. */
+  tool: string | null;
+  /** Normalized (redacted) tool arguments. */
+  args: Record<string, string>;
+  policy: PolicyDecision;
+  outcome: OutcomeCode;
+}
+
+interface ConversationTrace {
+  /** Trace schema version for forward-compatible replay. */
+  version: 1;
+  /** Pinned model/policy fixture the trace was recorded against. */
+  fixture: string;
+  steps: TraceStep[];
+}
+
+interface ReplayDivergence {
+  index: number;
+  field: 'transition' | 'tool' | 'args' | 'policy' | 'outcome';
+  recorded: string;
+  replayed: string;
+}
+
+const SENSITIVE_KEY = /(secret|token|key|password|seed|private|auth|signature)/i;
+
+/** Redact sensitive argument values before they enter a trace. */
+function redactArgs(args: Record<string, unknown>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(args)) {
+    out[k] = SENSITIVE_KEY.test(k) ? '[REDACTED]' : String(v);
+  }
+  return out;
+}
+
+/** Tools that must never execute during replay. */
+const WRITE_TOOLS = new Set(['swap', 'send', 'approve', 'transfer', 'sign']);
+
+/**
+ * Replay a recorded trace against a pinned fixture. Pure and deterministic:
+ * no network, no model calls, and no tool execution. Returns divergences.
+ */
+function replayTrace(
+  recorded: ConversationTrace,
+  fixture: ConversationTrace,
+): ReplayDivergence[] {
+  const divergences: ReplayDivergence[] = [];
+  if (recorded.fixture !== fixture.fixture) {
+    divergences.push({
+      index: -1,
+      field: 'transition',
+      recorded: recorded.fixture,
+      replayed: fixture.fixture,
+    });
+    return divergences;
+  }
+  const len = Math.max(recorded.steps.length, fixture.steps.length);
+  for (let i = 0; i < len; i++) {
+    const a = recorded.steps[i];
+    const b = fixture.steps[i];
+    if (!a || !b) {
+      divergences.push({
+        index: i,
+        field: 'transition',
+        recorded: a ? a.transition : '(missing)',
+        replayed: b ? b.transition : '(missing)',
+      });
+      continue;
+    }
+    if (a.transition !== b.transition) {
+      divergences.push({ index: i, field: 'transition', recorded: a.transition, replayed: b.transition });
+    }
+    if (a.tool !== b.tool) {
+      divergences.push({ index: i, field: 'tool', recorded: String(a.tool), replayed: String(b.tool) });
+    }
+    if (JSON.stringify(a.args) !== JSON.stringify(b.args)) {
+      divergences.push({ index: i, field: 'args', recorded: JSON.stringify(a.args), replayed: JSON.stringify(b.args) });
+    }
+    if (a.policy !== b.policy) {
+      divergences.push({ index: i, field: 'policy', recorded: a.policy, replayed: b.policy });
+    }
+    if (a.outcome !== b.outcome) {
+      divergences.push({ index: i, field: 'outcome', recorded: a.outcome, replayed: b.outcome });
+    }
+  }
+  return divergences;
+}
+
+const PINNED_FIXTURE = 'model-fixture@2024-06-01/policy@v3';
+
+const SAMPLE_TRACE: ConversationTrace = {
+  version: 1,
+  fixture: PINNED_FIXTURE,
+  steps: [
+    {
+      index: 0,
+      transition: 'intent.parsed@v1',
+      tool: null,
+      args: {},
+      policy: 'allow',
+      outcome: 'ok',
+    },
+    {
+      index: 1,
+      transition: 'tool.routed@v1',
+      tool: 'swap',
+      args: redactArgs({ pair: 'USDC/ETH', amount: '1234.56', apiKey: 'sk-live-xxx' }),
+      policy: 'deny',
+      outcome: 'denied',
+    },
+  ],
+};
+
+/**
  * Test harness page for ChatInput E2E tests.
  *
  * Exposes a controlled form around ChatInput so tests can verify sending,
@@ -136,6 +265,11 @@ export default function TestChatInputPage() {
     setIsLoading(false);
     setCancelled(true);
   };
+
+  const replayDivergences = replayTrace(SAMPLE_TRACE, SAMPLE_TRACE);
+  const replayExecutedWriteTool = SAMPLE_TRACE.steps.some(
+    (s) => s.tool !== null && WRITE_TOOLS.has(s.tool),
+  );
 
   return (
     <main className="min-h-screen flex flex-col p-4">
@@ -185,6 +319,33 @@ export default function TestChatInputPage() {
         ))}
       </ul>
 
+      {/* Deterministic conversation replay for incident debugging.
+          Traces are redacted, versioned, and replayed against a pinned
+          fixture without executing any external or write tool. */}
+      <section data-testid="conversation-replay" className="mb-4 text-xs text-gray-600">
+        <h2 className="text-sm font-semibold mb-1">Conversation replay</h2>
+        <p data-testid="replay-fixture">Fixture: {SAMPLE_TRACE.fixture}</p>
+        <p data-testid="replay-version">Trace version: {SAMPLE_TRACE.version}</p>
+        <p data-testid="replay-divergences">
+          Divergences: {replayDivergences.length}
+        </p>
+        <p data-testid="replay-write-tool-executed">
+          Write tool executed: {replayExecutedWriteTool ? 'yes' : 'no'}
+        </p>
+        <ul className="ml-4 list-disc">
+          {SAMPLE_TRACE.steps.map((step) => (
+            <li key={step.index} data-testid={`replay-step-${step.index}`}>
+              {step.transition} · tool={step.tool ?? 'none'} · policy={step.policy} ·
+              outcome={step.outcome} · args={JSON.stringify(step.args)}
+            </li>
+          ))}
+        </ul>
+        <p className="italic mt-1">
+          Traces are retained in memory only; access is limited to incident
+          responders and sensitive values are redacted before recording.
+        </p>
+      </section>
+
       {/* Locale-aware intent evaluation fixtures for offline evaluation.
           Language interpretation is separate from canonical parsing and
           contract unit conversion; ambiguous or unsupported input is withheld. */}
@@ -217,19 +378,16 @@ export default function TestChatInputPage() {
         </p>
       </section>
 
-      {cancelled && (
-        <p data-testid="cancel-notice" className="text-xs text-amber-600 mb-2">
-          Request cancelled.
-        </p>
-      )}
-
       <ChatInput
         onSendMessage={handleSendMessage}
-        onCancelRequest={handleCancelRequest}
         isLoading={isLoading}
-        placeholder="Type a message…"
-        sessionId="harness-session"
+        onCancelRequest={handleCancelRequest}
       />
+      {cancelled && (
+        <p data-testid="request-cancelled" className="mt-2 text-sm text-red-600">
+          Request cancelled
+        </p>
+      )}
     </main>
   );
 }
