@@ -2,13 +2,13 @@ import { NextRequest, NextResponse } from 'next/server';
 import { ReconciliationRecord } from '../../../../types';
 import { requireAdminAuth } from '../_utils/requireAdminAuth';
 import { enforceAdminIpAllowlist } from '@/lib/security';
+import { reconcileStalePayouts } from '@/lib/payout/reconciliation';
 
 export async function GET(request: NextRequest) {
   try {
     const blockedResponse = enforceAdminIpAllowlist(request);
     if (blockedResponse) return blockedResponse;
 
-    // For now, return mock data
     const authError = requireAdminAuth(request);
     if (authError) {
       return authError;
@@ -19,6 +19,46 @@ export async function GET(request: NextRequest) {
     console.error('Error fetching reconciliation data:', error);
     return NextResponse.json(
       { error: 'Failed to fetch reconciliation data' },
+      { status: 500 },
+    );
+  }
+}
+
+export async function POST(request: NextRequest) {
+  try {
+    const blockedResponse = enforceAdminIpAllowlist(request);
+    if (blockedResponse) return blockedResponse;
+
+    const authError = requireAdminAuth(request);
+    if (authError) {
+      return authError;
+    }
+
+    let body: Record<string, unknown> = {};
+    try {
+      body = await request.json();
+    } catch {
+      // Body is optional; default to empty object
+    }
+
+    const staleAgeMs =
+      typeof body.staleAgeMs === 'number' ? body.staleAgeMs : undefined;
+    const batchSize =
+      typeof body.batchSize === 'number' ? body.batchSize : undefined;
+
+    const summary = await reconcileStalePayouts({
+      staleAgeMs,
+      batchSize,
+    });
+
+    return NextResponse.json({
+      success: true,
+      data: summary,
+    });
+  } catch (error) {
+    console.error('Error running reconciliation:', error);
+    return NextResponse.json(
+      { error: 'Failed to run payout reconciliation' },
       { status: 500 },
     );
   }

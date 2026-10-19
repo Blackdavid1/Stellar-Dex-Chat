@@ -17,7 +17,18 @@ const idempotencyCache = new Map<
 >();
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
 
+export async function OPTIONS(request: NextRequest) {
+  return (
+    enforcePayoutRouteSecurity(request) ||
+    new NextResponse(null, { status: 204 })
+  );
+}
+
 export async function POST(request: NextRequest) {
+  // Enforce payout API security
+  const securityBlocked = enforcePayoutRouteSecurity(request);
+  if (securityBlocked) return securityBlocked;
+
   const ip = getClientIp(request);
   const limited = applyRateLimit(ip, '/api/initiate-transfer', RATE_LIMIT);
   if (limited) return limited;
@@ -184,7 +195,8 @@ export async function POST(request: NextRequest) {
         reference: idempotencyKey,
         status: 'pending',
         amount: Number(amount),
-        updatedAt: new Date().toISOString(),
+        updatedAt: new Date(now).toISOString(),
+        updatedAtMs: now,
         clientSessionId,
         failureReason: `Transient error: ${errorMessage}. Queued for retry.`,
       });
@@ -236,18 +248,19 @@ export async function POST(request: NextRequest) {
 
     console.error('Initiate transfer error:', error);
 
+    const errorDetails = handlePayoutApiError(
+      error,
+      'Failed to initiate transfer. Please try again.',
+    );
+
     telemetry.finishSpan(span.spanId, {
       success: false,
-      error: 'Failed to initiate transfer. Please try again.',
-      errorType: 'unknown_error',
+      error: errorDetails.body.message,
     });
 
-    return NextResponse.json(
-      {
-        success: false,
-        message: 'Failed to initiate transfer. Please try again.',
-      },
-      { status: 500 },
-    );
+    return NextResponse.json(errorDetails.body, {
+      status: errorDetails.status,
+      headers: errorDetails.headers,
+    });
   }
 }

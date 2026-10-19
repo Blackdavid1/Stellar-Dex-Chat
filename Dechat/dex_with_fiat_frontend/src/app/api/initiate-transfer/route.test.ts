@@ -4,6 +4,8 @@ import { z } from 'zod';
 import { payoutRetryQueue } from '@/lib/payout/retryQueue';
 import { payoutAuditLedger } from '@/lib/payout/auditLedger';
 
+vi.mock('server-only', () => ({}));
+
 const mockSchema = z.object({
   source: z.string().min(1),
   reason: z.string().min(1),
@@ -77,7 +79,10 @@ describe('POST /api/initiate-transfer', () => {
       new Request('http://localhost/api/initiate-transfer', {
         method: 'POST',
         body: 'not json{{{',
-        headers: { 'content-type': 'application/json' },
+        headers: {
+          'content-type': 'application/json',
+          'x-idempotency-key': 'test-idempotency-key',
+        },
       }),
     );
 
