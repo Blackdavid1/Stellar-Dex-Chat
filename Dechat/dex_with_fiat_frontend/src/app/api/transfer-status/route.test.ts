@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { NextRequest } from 'next/server';
 
+vi.mock('server-only', () => ({}));
+
 const applyRateLimitMock = vi.fn<(...args: unknown[]) => null>(() => null);
 
 vi.mock('@/lib/rateLimit', () => ({
@@ -12,6 +14,7 @@ vi.mock('@/lib/rateLimit', () => ({
 
 vi.mock('@/lib/payout/providers/registry', () => ({
   getPayoutProvider: () => ({
+    name: 'paystack',
     checkTransferStatus: vi
       .fn()
       .mockResolvedValue({ reference: 'ref-123', status: 'success' }),

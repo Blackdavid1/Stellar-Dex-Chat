@@ -56,6 +56,7 @@ pub enum Error {
     NotOperator = 205,
     SameAdmin = 207,
     OperatorCapReached = 206,
+    RoleNotFound = 208,
 
     // --- 300 series: Constraints & Limits ---
     ZeroAmount = 301,
@@ -77,6 +78,8 @@ pub enum Error {
     InvalidAmount = 317,
     SelfReferentialAddress = 318,
     LimitCapCannotBeLowered = 319,
+    RateLimitExceeded = 320,
+    DepositRateLimitExceeded = 321,
 
     // --- 400 series: Funds & Balances ---
     InsufficientFunds = 401,
@@ -101,6 +104,12 @@ pub enum Error {
     OraclePriceInvalid = 702,
     SlippageExceeded = 703,
     SlippageTooHigh = 704,
+    OracleObservationMissing = 705,
+    OracleObservationStale = 706,
+    OracleObservationFutureDated = 707,
+    OracleConfidenceTooLow = 708,
+    OracleConfigInvalid = 709,
+    FiatConversionOverflow = 710,
 
     // --- 800 series: Quota & Migration ---
     WithdrawalQuotaExceeded = 801,
@@ -123,6 +132,14 @@ pub enum Error {
     ProposalAlreadyExecuted = 1106,
     ThresholdNotMet = 1107,
     MaxSignersReached = 1108,
+
+    // --- 1200 series: Cancellation lifecycle ---
+    /// A cancellation has already been requested for this withdrawal.
+    CancellationAlreadyRequested = 1201,
+    /// No cancellation request exists for this withdrawal.
+    CancellationNotRequested = 1202,
+    /// The cancellation has not been approved by an admin yet.
+    CancellationNotApproved = 1203,
 }
 
 // ── Models ────────────────────────────────────────────────────────────────
@@ -278,6 +295,47 @@ pub struct BatchHeartbeatResult {
     pub failed_index: Option<u32>,
 }
 
+/// Status of a cancellation request in the two-phase lifecycle.
+///
+/// The state machine is:
+/// ```
+/// Requested  ──(approve_cancellation)──►  Approved
+///                                              │
+///                                    (finalize_cancellation)
+///                                              │
+///                                              ▼
+///                                       [deleted from storage]
+/// ```
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CancellationStatus {
+    /// Cancellation has been requested (by user or admin) but not yet approved.
+    Requested,
+    /// Cancellation has been approved by an admin and is ready to finalize.
+    Approved,
+}
+
+/// A pending cancellation record stored alongside the original [`WithdrawRequest`].
+///
+/// Keyed by the same `request_id` as the originating withdrawal, stored under
+/// [`DataKey::CancellationRequest`].  Deleted atomically when
+/// `finalize_cancellation` executes the refund.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CancellationRequest {
+    /// Stable identifier matching the originating [`WithdrawRequest`].
+    pub request_id: u64,
+    /// Address that initiated the cancellation request (user or admin).
+    pub requested_by: Address,
+    /// Ledger at which the request was filed.
+    pub requested_at: u32,
+    /// Current lifecycle status.
+    pub status: CancellationStatus,
+    /// Remaining `amount` on the withdrawal request at the time of the
+    /// cancellation request — captures the post-partial-payment residual.
+    pub amount_at_request: i128,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TokenAllowlistEntry {
@@ -323,6 +381,83 @@ pub struct ConfigSnapshot {
     pub circuit_breaker_threshold: i128,
     pub circuit_breaker_reset_window: u32,
     pub multisig_threshold: u32,
+}
+
+// ── Issue #19: Multisig Signer & Threshold Rotation ───────────────────
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SignerRotationProposal {
+    pub id: u64,
+    pub proposer: Address,
+    pub new_signers: Vec<Address>,
+    pub new_threshold: u32,
+    pub approvals: Vec<Address>,
+    pub eta: u32,
+    pub executed: bool,
+    pub cancelled: bool,
+    pub created_at: u32,
+}
+
+// ── Issue #20: Capabilities & Explicit Roles ──────────────────────────
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum Role {
+    Admin = 1,
+    Operator = 2,
+    Auditor = 3,
+}
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum RoleChangeAction {
+    Grant = 1,
+    Revoke = 2,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoleChangeProposal {
+    pub id: u64,
+    pub proposer: Address,
+    pub target: Address,
+    pub role: Role,
+    pub action: RoleChangeAction,
+    pub eta: u32,
+    pub executed: bool,
+    pub cancelled: bool,
+    pub created_at: u32,
+}
+
+// ── Issue #21: Operator Pruning Batch Result ──────────────────────────
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PruneBatchResult {
+    pub processed: u32,
+    pub pruned: u32,
+    pub next_cursor: u32,
+    pub is_complete: bool,
+}
+
+// ── Issue #22: Ledger-window Rate Limits ──────────────────────────────
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RateLimitRetryTiming {
+    pub current_ledger: u32,
+    pub retry_after_ledger: u32,
+    pub wait_ledgers: u32,
+    pub current_count: u32,
+    pub limit: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RateLimitUsage {
+    pub operation: Symbol,
+    pub ledger: u32,
+    pub current_count: u32,
+    pub limit: u32,
 }
 
 // ── Events ────────────────────────────────────────────────────────────────
@@ -396,6 +531,43 @@ pub struct WithdrawalExecutedEvent {
 pub struct WithdrawalCancelledEvent {
     pub version: u32,
     pub request_id: u64,
+}
+
+/// Emitted when a user or admin files a cancellation request for a queued withdrawal.
+/// Indexers can correlate with the original `WithdrawalRequestedEvent` via `request_id`.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct CancellationRequestedEvent {
+    pub version: u32,
+    /// The withdrawal queue identifier.
+    pub request_id: u64,
+    /// Address that initiated the cancellation.
+    pub requested_by: Address,
+    /// Remaining amount on the withdrawal at request time.
+    pub amount_at_request: i128,
+}
+
+/// Emitted when an admin approves a pending cancellation request.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct CancellationApprovedEvent {
+    pub version: u32,
+    pub request_id: u64,
+    /// Admin that approved the cancellation.
+    pub approved_by: Address,
+}
+
+/// Emitted when a cancellation is finalized and funds are released back to escrow.
+/// Carries a link to the original withdrawal request for full auditability.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct CancellationFinalizedEvent {
+    pub version: u32,
+    pub request_id: u64,
+    /// Amount that was still outstanding and has now been released back to the pool.
+    pub released_amount: i128,
+    /// The `to` address from the original withdrawal request.
+    pub original_recipient: Address,
 }
 
 #[contractevent]
@@ -755,6 +927,95 @@ pub struct FeeWithdrawalBatchNonceEvent {
     pub caller: Address,
     pub new_nonce: u64,
 }
+
+// ── Issue #19 Events ──────────────────────────────────────────────────
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct SignerRotationProposedEvent {
+    pub version: u32,
+    pub id: u64,
+    pub proposer: Address,
+    pub new_threshold: u32,
+    pub eta: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct SignerRotationApprovedEvent {
+    pub version: u32,
+    pub id: u64,
+    pub signer: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct SignerRotationCancelledEvent {
+    pub version: u32,
+    pub id: u64,
+    pub by: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct SignerRotationExecutedEvent {
+    pub version: u32,
+    pub id: u64,
+    pub new_threshold: u32,
+    pub signers_count: u32,
+}
+
+// ── Issue #20 Events ──────────────────────────────────────────────────
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct RoleChangeProposedEvent {
+    pub version: u32,
+    pub id: u64,
+    pub target: Address,
+    pub role: Role,
+    pub action: RoleChangeAction,
+    pub eta: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct RoleChangeCancelledEvent {
+    pub version: u32,
+    pub id: u64,
+    pub by: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct RoleChangedEvent {
+    pub version: u32,
+    pub target: Address,
+    pub role: Role,
+    pub action: RoleChangeAction,
+    pub by: Address,
+    pub ledger: u32,
+}
+
+// ── Issue #22 Events ──────────────────────────────────────────────────
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct RateLimitExceededEvent {
+    pub version: u32,
+    pub operation: Symbol,
+    pub current_ledger: u32,
+    pub retry_after_ledger: u32,
+    pub current_count: u32,
+    pub limit: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct RateLimitConfiguredEvent {
+    pub version: u32,
+    pub operation: Symbol,
+    pub limit: u32,
+    pub by: Address,
+}
+
 // ── Storage keys ──────────────────────────────────────────────────────────
 #[contracttype]
 pub enum DataKey {
@@ -859,6 +1120,8 @@ pub enum DataKey {
     UpgradeCancellationNonce(Address),
     /// Per-admin replay-protection nonce for `set_limit`.
     SetLimitNonce(Address),
+    /// Pending cancellation lifecycle record keyed by withdrawal `request_id`.
+    CancellationRequest(u64),
 }
 
 const ORACLE_PRICE_DECIMALS: i128 = 10_000_000;
@@ -1022,6 +1285,29 @@ impl FiatBridge {
             .instance()
             .set(&DataKey::UpgradeDelay, &MIN_UPGRADE_DELAY);
 
+        // Issue #20: initialize default role membership for admin
+        let mut admin_members = Vec::new(&env);
+        admin_members.push_back(admin.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::RoleMembers(Role::Admin), &admin_members);
+        env.storage()
+            .persistent()
+            .set(&DataKey::HasRole(Role::Admin, admin.clone()), &true);
+        env.storage()
+            .instance()
+            .set(&DataKey::NextRoleProposalID, &0u64);
+
+        // Issue #19: initialize next rotation ID
+        env.storage()
+            .instance()
+            .set(&DataKey::NextSignerRotationID, &0u64);
+
+        // Issue #21: initialize operator prune cursor
+        env.storage()
+            .instance()
+            .set(&DataKey::OperatorPruneCursor, &0u32);
+
         // ── Issue #214: store and emit immutable deployment config hash ──
         let config_data = (admin.clone(), token.clone(), limit);
         let config_hash: BytesN<32> = env.crypto().sha256(&config_data.to_xdr(&env)).into();
@@ -1114,6 +1400,7 @@ impl FiatBridge {
         // Reject a tripped breaker before any quota accounting or token call.
         // The rolling-volume helper below still handles lazy auto-reset.
         Self::require_circuit_breaker_clear(&env)?;
+        Self::check_and_increment_rate_limit(&env, Symbol::new(&env, "deposit"))?;
 
         if amount <= 0 {
             return Err(Error::ZeroAmount);
@@ -1432,6 +1719,8 @@ impl FiatBridge {
             } else {
                 return Err(Error::Unauthorized);
             }
+        } else if Self::has_role(env.clone(), caller.clone(), Role::Operator) {
+            caller.require_auth();
         } else {
             return Err(Error::Unauthorized);
         }
@@ -1527,6 +1816,7 @@ impl FiatBridge {
         let _admin = Self::require_admin(&env)?;
         Self::require_not_paused(&env)?;
         Self::require_circuit_breaker_clear(&env)?;
+        Self::check_and_increment_rate_limit(&env, Symbol::new(&env, "withdrawal_request"))?;
 
         if amount <= 0 {
             return Err(Error::ZeroAmount);
@@ -1696,6 +1986,7 @@ impl FiatBridge {
     ) -> Result<(), Error> {
         env.storage().instance().extend_ttl(MIN_TTL, MAX_TTL);
         Self::require_not_paused(&env)?;
+        Self::check_and_increment_rate_limit(&env, Symbol::new(&env, "withdrawal_execution"))?;
         let mut request: WithdrawRequest = env
             .storage()
             .persistent()
@@ -1864,6 +2155,215 @@ impl FiatBridge {
         .publish(&env);
 
         Ok(())
+    }
+
+    // ── Cancellation lifecycle (Issue #14) ────────────────────────────────
+
+    /// Requests cancellation of a queued withdrawal.
+    ///
+    /// Either the withdrawal recipient (`request.to`) **or** the admin may file a
+    /// cancellation request.  This does not yet remove the withdrawal from the
+    /// queue; it creates a [`CancellationRequest`] record that must be approved
+    /// by the admin via [`approve_cancellation`] and finalised via
+    /// [`finalize_cancellation`] before any liability is released.
+    ///
+    /// # Arguments
+    /// * `env` – The Soroban host environment.
+    /// * `request_id` – Queue ID of the withdrawal to cancel.
+    /// * `caller` – Address filing the request; must be either the admin or
+    ///   the withdrawal's `to` address.
+    ///
+    /// # Errors
+    /// * [`Error::RequestNotFound`] – `request_id` does not exist.
+    /// * [`Error::ContractPaused`] – Contract is paused.
+    /// * [`Error::Unauthorized`] – `caller` is neither the admin nor `request.to`.
+    /// * [`Error::CancellationAlreadyRequested`] – A cancellation is already pending.
+    pub fn request_cancellation(
+        env: Env,
+        request_id: u64,
+        caller: Address,
+    ) -> Result<(), Error> {
+        env.storage().instance().extend_ttl(MIN_TTL, MAX_TTL);
+        Self::require_not_paused(&env)?;
+        caller.require_auth();
+
+        let request: WithdrawRequest = env
+            .storage()
+            .persistent()
+            .get(&DataKey::WithdrawQueue(request_id))
+            .ok_or(Error::RequestNotFound)?;
+
+        // Only the admin or the designated recipient may request cancellation.
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        if caller != admin && caller != request.to {
+            return Err(Error::Unauthorized);
+        }
+
+        // Guard: duplicate cancellation request.
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::CancellationRequest(request_id))
+        {
+            return Err(Error::CancellationAlreadyRequested);
+        }
+
+        let amount_at_request = request.amount;
+
+        let cancellation = CancellationRequest {
+            request_id,
+            requested_by: caller.clone(),
+            requested_at: env.ledger().sequence(),
+            status: CancellationStatus::Requested,
+            amount_at_request,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::CancellationRequest(request_id), &cancellation);
+
+        CancellationRequestedEvent {
+            version: EVENT_VERSION,
+            request_id,
+            requested_by: caller,
+            amount_at_request,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Approves a pending cancellation request filed via [`request_cancellation`].
+    ///
+    /// Only the admin may call this.  Approval advances the [`CancellationRequest`]
+    /// state from `Requested` to `Approved`, which signals that
+    /// [`finalize_cancellation`] may proceed.
+    ///
+    /// # Arguments
+    /// * `env` – The Soroban host environment.
+    /// * `request_id` – Queue ID of the withdrawal whose cancellation to approve.
+    ///
+    /// # Errors
+    /// * [`Error::ContractPaused`] – Contract is paused.
+    /// * [`Error::Unauthorized`] – Caller is not the admin.
+    /// * [`Error::CancellationNotRequested`] – No cancellation is pending for this id.
+    pub fn approve_cancellation(env: Env, request_id: u64) -> Result<(), Error> {
+        env.storage().instance().extend_ttl(MIN_TTL, MAX_TTL);
+        Self::require_not_paused(&env)?;
+        let admin = Self::require_admin(&env)?;
+
+        let mut cancellation: CancellationRequest = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CancellationRequest(request_id))
+            .ok_or(Error::CancellationNotRequested)?;
+
+        cancellation.status = CancellationStatus::Approved;
+        env.storage()
+            .persistent()
+            .set(&DataKey::CancellationRequest(request_id), &cancellation);
+
+        CancellationApprovedEvent {
+            version: EVENT_VERSION,
+            request_id,
+            approved_by: admin,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Finalizes an approved cancellation, releasing reserved liabilities and
+    /// removing the queued withdrawal.
+    ///
+    /// This is the terminal step of the cancellation lifecycle.  It requires
+    /// the associated [`CancellationRequest`] to be in the `Approved` state.
+    /// On success:
+    /// 1. The [`CancellationRequest`] record is deleted.
+    /// 2. The withdrawal is removed from the queue.
+    /// 3. Liabilities are decremented by the **current** remaining amount
+    ///    on the request (which may differ from `amount_at_request` if a
+    ///    partial execution occurred between request and finalization).
+    /// 4. [`CancellationFinalizedEvent`] and [`WithdrawalCancelledEvent`] are
+    ///    both emitted to maintain a complete, stable audit trail.
+    ///
+    /// # Arguments
+    /// * `env` – The Soroban host environment.
+    /// * `request_id` – Queue ID of the withdrawal to finalize.
+    ///
+    /// # Errors
+    /// * [`Error::ContractPaused`] – Contract is paused.
+    /// * [`Error::Unauthorized`] – Caller is not the admin.
+    /// * [`Error::CancellationNotRequested`] – No cancellation record found.
+    /// * [`Error::CancellationNotApproved`] – Cancellation exists but is not yet approved.
+    /// * [`Error::RequestNotFound`] – Underlying withdrawal no longer exists
+    ///   (e.g. fully executed before finalization).
+    pub fn finalize_cancellation(env: Env, request_id: u64) -> Result<(), Error> {
+        env.storage().instance().extend_ttl(MIN_TTL, MAX_TTL);
+        Self::require_not_paused(&env)?;
+        let _admin = Self::require_admin(&env)?;
+
+        let cancellation: CancellationRequest = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CancellationRequest(request_id))
+            .ok_or(Error::CancellationNotRequested)?;
+
+        if cancellation.status != CancellationStatus::Approved {
+            return Err(Error::CancellationNotApproved);
+        }
+
+        // The withdrawal must still exist; it may have been partially executed.
+        let request: WithdrawRequest = env
+            .storage()
+            .persistent()
+            .get(&DataKey::WithdrawQueue(request_id))
+            .ok_or(Error::RequestNotFound)?;
+
+        // Use the current residual amount, not the snapshot, so a partial
+        // execution that happened between request and finalization is honoured.
+        let released_amount = request.amount;
+        let original_recipient = request.to.clone();
+
+        // Clean up the cancellation record before mutating queue state.
+        env.storage()
+            .persistent()
+            .remove(&DataKey::CancellationRequest(request_id));
+
+        Self::release_liability(&env, &request.token, released_amount)?;
+        Self::remove_from_withdraw_queue(&env, request_id, &request);
+
+        Self::check_invariants(&env, &request.token)?;
+
+        // Emit both events: the stable `WithdrawalCancelledEvent` for backward
+        // compatibility with existing indexers, and the new richer event.
+        WithdrawalCancelledEvent {
+            version: EVENT_VERSION,
+            request_id,
+        }
+        .publish(&env);
+
+        CancellationFinalizedEvent {
+            version: EVENT_VERSION,
+            request_id,
+            released_amount,
+            original_recipient,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Returns the pending [`CancellationRequest`] for `request_id`, if any.
+    ///
+    /// Returns `None` when no cancellation has been filed.
+    pub fn get_cancellation_request(env: Env, request_id: u64) -> Option<CancellationRequest> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CancellationRequest(request_id))
     }
 
     /// Reclaim an expired withdrawal request.
@@ -2402,6 +2902,15 @@ impl FiatBridge {
         }
         .publish(env);
 
+        // Issue #8: limit comparisons use the checked conversion helper so
+        // rounding is identical on every path.
+        let _ = crate::math::convert_token_to_fiat(
+            actual_price,
+            1,
+            ORACLE_PRICE_DECIMALS,
+            ORACLE_PRICE_DECIMALS,
+        )?;
+
         // Check slippage using cross-multiplication to avoid division errors.
         // We allow extra tolerance to account for ceiling division rounding in tests:
         // Reject if: (expected - actual) * 10_000 > 2 * max_slippage_bps * expected
@@ -2471,19 +2980,22 @@ impl FiatBridge {
 
         let oracle_addr = env.storage().instance().get::<_, Address>(&DataKey::Oracle);
         let price = if let Some(addr) = oracle_addr {
-            let oracle = crate::oracle::OracleClient::new(env, &addr);
-            let p = oracle.get_price(token).unwrap_or(0);
-            if p <= 0 {
-                return Err(Error::OraclePriceInvalid);
-            }
-            p
+            // Issue #7: reject stale, future-dated, missing or low-confidence
+            // observations before the price is used for any limit decision.
+            let observation = crate::oracle::validate_observation(env, &addr, token)?;
+            observation.price
         } else {
             return Err(Error::OracleNotSet);
         };
 
         if let Some(limit) = fiat_limit {
-            // ── Issue #220: use precision-safe fixed-point math ───────────
-            let usd_cents = crate::math::mul_div_floor(amount, price, ORACLE_PRICE_DECIMALS / 100);
+            // Issue #8: single checked token→fiat conversion helper.
+            let usd_cents = crate::math::convert_token_to_fiat(
+                amount,
+                price,
+                TOKEN_DECIMALS,
+                ORACLE_PRICE_DECIMALS,
+            )?;
             let curr = env.ledger().sequence();
             let mut vol: UserDailyVolume = env
                 .storage()
@@ -2508,6 +3020,33 @@ impl FiatBridge {
         }
 
         Ok(price)
+    }
+
+    /// Configure the freshness and confidence bounds enforced on oracle
+    /// observations for `oracle` (Issue #7).
+    ///
+    /// * `max_age_ledgers` – maximum accepted observation age in ledgers.
+    /// * `min_confidence`  – minimum accepted confidence, in basis points.
+    pub fn set_oracle_config(
+        env: Env,
+        oracle: Address,
+        max_age_ledgers: u32,
+        min_confidence: u32,
+    ) -> Result<(), Error> {
+        let _admin = Self::require_admin(&env)?;
+        if max_age_ledgers == 0 || min_confidence > 10_000 {
+            return Err(Error::OracleConfigInvalid);
+        }
+        env.storage().instance().set(
+            &DataKey::OracleConfig(oracle),
+            &(max_age_ledgers, min_confidence),
+        );
+        Ok(())
+    }
+
+    /// Return the configured `(max_age_ledgers, min_confidence)` for `oracle`.
+    pub fn get_oracle_config(env: Env, oracle: Address) -> Option<(u32, u32)> {
+        env.storage().instance().get(&DataKey::OracleConfig(oracle))
     }
 
     fn enforce_daily_deposit_limit(
@@ -2659,7 +3198,7 @@ impl FiatBridge {
         }
 
         // Validate and increment nonce for replay protection
-        Self::validate_and_increment_nonce(&env, &operator, nonce)?;
+        Self::validate_and_increment_operator_config_nonce(&env, &operator, nonce)?;
 
         Self::prune_inactive_operators_internal(&env);
         let was_active = env
@@ -2689,6 +3228,12 @@ impl FiatBridge {
         if active {
             if !was_active {
                 operators.push_back(operator.clone());
+                env.storage()
+                    .instance()
+                    .set(&DataKey::OperatorHeartbeat(operator.clone()), &env.ledger().sequence());
+                env.storage()
+                    .instance()
+                    .set(&DataKey::OperatorRegisteredAt(operator.clone()), &env.ledger().sequence());
             }
         } else if was_active {
             operators = Self::remove_operator_from_list(&env, &operators, &operator);
@@ -2912,6 +3457,13 @@ impl FiatBridge {
             .unwrap_or(0)
     }
 
+    pub fn get_operator_config_nonce(env: Env, operator: Address) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::OperatorConfigNonce(operator))
+            .unwrap_or(0)
+    }
+
     pub fn prune_inactive_operators(env: Env) -> Result<(), Error> {
         let _admin = Self::require_admin(&env)?;
         Self::prune_inactive_operators_internal(&env);
@@ -2962,6 +3514,28 @@ impl FiatBridge {
         NonceConsumedEvent {
             version: EVENT_VERSION,
             scope: Symbol::new(env, "operator"),
+            owner: operator.clone(),
+            new_nonce,
+        }
+        .publish(env);
+
+        Ok(())
+    }
+
+    fn validate_and_increment_operator_config_nonce(
+        env: &Env,
+        operator: &Address,
+        provided_nonce: u64,
+    ) -> Result<(), Error> {
+        let new_nonce = Self::consume_nonce(
+            env,
+            DataKey::OperatorConfigNonce(operator.clone()),
+            provided_nonce,
+        )?;
+
+        NonceConsumedEvent {
+            version: EVENT_VERSION,
+            scope: Symbol::new(env, "operator_config"),
             owner: operator.clone(),
             new_nonce,
         }
@@ -3053,9 +3627,17 @@ impl FiatBridge {
                 .storage()
                 .instance()
                 .get::<_, u32>(&DataKey::OperatorHeartbeat(operator.clone()));
-            let is_inactive = heartbeat
-                .map(|last| current_ledger.saturating_sub(last) > threshold)
-                .unwrap_or(false);
+            let registered_at = env
+                .storage()
+                .instance()
+                .get::<_, u32>(&DataKey::OperatorRegisteredAt(operator.clone()));
+            let is_inactive = match heartbeat {
+                Some(last) => current_ledger.saturating_sub(last) > threshold,
+                None => match registered_at {
+                    Some(reg) => current_ledger.saturating_sub(reg) > threshold,
+                    None => true,
+                },
+            };
 
             if is_inactive {
                 env.storage()
@@ -5420,6 +6002,780 @@ impl FiatBridge {
     pub fn get_fee_withdrawal_batch_nonce(env: Env, caller: Address) -> u64 {
         Self::get_fee_withdrawal_nonce(env, caller)
     }
+
+    // ── Issue #19: Multisig Signer & Threshold Rotation ───────────────────
+
+    pub fn propose_signer_rotation(
+        env: Env,
+        proposer: Address,
+        new_signers: Vec<Address>,
+        new_threshold: u32,
+        delay: u32,
+    ) -> Result<u64, Error> {
+        proposer.require_auth();
+
+        let current_signers = Self::get_multisig_signers(env.clone());
+        if !current_signers.contains(&proposer) {
+            return Err(Error::Unauthorized);
+        }
+
+#[cfg(test)]
+mod test_oracle_freshness;
+
+#[cfg(test)]
+mod test_init_validation;
+
+        // Validate uniqueness
+        let mut seen = Vec::new(&env);
+        for s in new_signers.iter() {
+            if seen.contains(&s) {
+                return Err(Error::DuplicateSigner);
+            }
+            seen.push_back(s);
+        }
+
+        // Validate threshold bounds (loss-of-quorum prevention)
+        if new_threshold == 0 || new_threshold > new_signers.len() {
+            return Err(Error::InvalidThreshold);
+        }
+
+        // Delayed activation
+        if delay == 0 {
+            return Err(Error::UpgradeDelayTooShort);
+        }
+
+        let current_ledger = env.ledger().sequence();
+        let eta = current_ledger.checked_add(delay).ok_or(Error::Overflow)?;
+
+        let id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextSignerRotationID)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::NextSignerRotationID, &(id + 1));
+
+        let mut approvals = Vec::new(&env);
+        approvals.push_back(proposer.clone());
+
+        let proposal = SignerRotationProposal {
+            id,
+            proposer: proposer.clone(),
+            new_signers,
+            new_threshold,
+            approvals,
+            eta,
+            executed: false,
+            cancelled: false,
+            created_at: current_ledger,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::SignerRotationProposal(id), &proposal);
+
+        SignerRotationProposedEvent {
+            version: EVENT_VERSION,
+            id,
+            proposer,
+            new_threshold,
+            eta,
+        }
+        .publish(&env);
+
+        Ok(id)
+    }
+
+    pub fn approve_signer_rotation(env: Env, signer: Address, proposal_id: u64) -> Result<(), Error> {
+        signer.require_auth();
+
+        let current_signers = Self::get_multisig_signers(env.clone());
+        if !current_signers.contains(&signer) {
+            return Err(Error::Unauthorized);
+        }
+
+        let mut proposal: SignerRotationProposal = env
+            .storage()
+            .instance()
+            .get(&DataKey::SignerRotationProposal(proposal_id))
+            .ok_or(Error::ProposalNotFound)?;
+
+        if proposal.executed {
+            return Err(Error::ProposalAlreadyExecuted);
+        }
+        if proposal.cancelled {
+            return Err(Error::ProposalCancelled);
+        }
+        if proposal.approvals.contains(&signer) {
+            return Err(Error::AlreadyApproved);
+        }
+
+        proposal.approvals.push_back(signer.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::SignerRotationProposal(proposal_id), &proposal);
+
+        SignerRotationApprovedEvent {
+            version: EVENT_VERSION,
+            id: proposal_id,
+            signer,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn cancel_signer_rotation(env: Env, caller: Address, proposal_id: u64) -> Result<(), Error> {
+        caller.require_auth();
+
+        let mut proposal: SignerRotationProposal = env
+            .storage()
+            .instance()
+            .get(&DataKey::SignerRotationProposal(proposal_id))
+            .ok_or(Error::ProposalNotFound)?;
+
+        if proposal.executed {
+            return Err(Error::ProposalAlreadyExecuted);
+        }
+        if proposal.cancelled {
+            return Err(Error::ProposalCancelled);
+        }
+
+        let current_signers = Self::get_multisig_signers(env.clone());
+        let admin: Option<Address> = env.storage().instance().get(&DataKey::Admin);
+        let is_admin = admin.map_or(false, |a| a == caller);
+        let is_signer = current_signers.contains(&caller);
+        let is_proposer = proposal.proposer == caller;
+
+        if !is_proposer && !is_signer && !is_admin {
+            return Err(Error::Unauthorized);
+        }
+
+        proposal.cancelled = true;
+        env.storage()
+            .instance()
+            .set(&DataKey::SignerRotationProposal(proposal_id), &proposal);
+
+        SignerRotationCancelledEvent {
+            version: EVENT_VERSION,
+            id: proposal_id,
+            by: caller,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn execute_signer_rotation(env: Env, proposal_id: u64) -> Result<(), Error> {
+        let mut proposal: SignerRotationProposal = env
+            .storage()
+            .instance()
+            .get(&DataKey::SignerRotationProposal(proposal_id))
+            .ok_or(Error::ProposalNotFound)?;
+
+        if proposal.executed {
+            return Err(Error::ProposalAlreadyExecuted);
+        }
+        if proposal.cancelled {
+            return Err(Error::ProposalCancelled);
+        }
+
+        if env.ledger().sequence() < proposal.eta {
+            return Err(Error::ActionNotReady);
+        }
+
+        // Loss-of-quorum prevention: require current active signers to meet current threshold
+        let current_signers = Self::get_multisig_signers(env.clone());
+        let current_threshold = Self::get_multisig_threshold(env.clone());
+        let valid_approvals = proposal
+            .approvals
+            .iter()
+            .filter(|s| current_signers.contains(s))
+            .count() as u32;
+
+        if valid_approvals < current_threshold {
+            return Err(Error::ThresholdNotMet);
+        }
+
+        // Apply rotation
+        proposal.executed = true;
+        env.storage()
+            .instance()
+            .set(&DataKey::SignerRotationProposal(proposal_id), &proposal);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Signers, &proposal.new_signers);
+        env.storage()
+            .instance()
+            .set(&DataKey::Threshold, &proposal.new_threshold);
+
+        SignerRotationExecutedEvent {
+            version: EVENT_VERSION,
+            id: proposal_id,
+            new_threshold: proposal.new_threshold,
+            signers_count: proposal.new_signers.len(),
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn get_signer_rotation_proposal(env: Env, id: u64) -> Option<SignerRotationProposal> {
+        env.storage().instance().get(&DataKey::SignerRotationProposal(id))
+    }
+
+    pub fn get_next_signer_rotation_id(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::NextSignerRotationID)
+            .unwrap_or(0)
+    }
+
+    // ── Issue #20: Capabilities & Explicit Roles ──────────────────────────
+
+    pub fn propose_role_change(
+        env: Env,
+        proposer: Address,
+        target: Address,
+        role: Role,
+        action: RoleChangeAction,
+        delay: u32,
+    ) -> Result<u64, Error> {
+        proposer.require_auth();
+        let admin = Self::require_admin(&env)?;
+        if proposer != admin {
+            return Err(Error::Unauthorized);
+        }
+        if delay == 0 {
+            return Err(Error::UpgradeDelayTooShort);
+        }
+        if target == env.current_contract_address() {
+            return Err(Error::InvalidRecipient);
+        }
+
+        let current_ledger = env.ledger().sequence();
+        let eta = current_ledger.checked_add(delay).ok_or(Error::Overflow)?;
+
+        let id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextRoleProposalID)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::NextRoleProposalID, &(id + 1));
+
+        let proposal = RoleChangeProposal {
+            id,
+            proposer: proposer.clone(),
+            target: target.clone(),
+            role,
+            action,
+            eta,
+            executed: false,
+            cancelled: false,
+            created_at: current_ledger,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::RoleChangeProposal(id), &proposal);
+
+        RoleChangeProposedEvent {
+            version: EVENT_VERSION,
+            id,
+            target,
+            role,
+            action,
+            eta,
+        }
+        .publish(&env);
+
+        Ok(id)
+    }
+
+    pub fn execute_role_change(env: Env, id: u64) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        let mut proposal: RoleChangeProposal = env
+            .storage()
+            .instance()
+            .get(&DataKey::RoleChangeProposal(id))
+            .ok_or(Error::ProposalNotFound)?;
+
+        if proposal.executed {
+            return Err(Error::ProposalAlreadyExecuted);
+        }
+        if proposal.cancelled {
+            return Err(Error::ProposalCancelled);
+        }
+        if env.ledger().sequence() < proposal.eta {
+            return Err(Error::ActionNotReady);
+        }
+
+        let mut members = Self::get_role_members_internal(&env, proposal.role);
+        match proposal.action {
+            RoleChangeAction::Grant => {
+                if !members.contains(&proposal.target) {
+                    members.push_back(proposal.target.clone());
+                }
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::HasRole(proposal.role, proposal.target.clone()), &true);
+                if proposal.role == Role::Operator {
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::Operator(proposal.target.clone()), &true);
+                    let mut ops = Self::get_operator_list(&env);
+                    if !ops.contains(&proposal.target) {
+                        ops.push_back(proposal.target.clone());
+                        env.storage().instance().set(&DataKey::OperatorList, &ops);
+                        env.storage().instance().set(&DataKey::OperatorCount, &ops.len());
+                    }
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::OperatorHeartbeat(proposal.target.clone()), &env.ledger().sequence());
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::OperatorRegisteredAt(proposal.target.clone()), &env.ledger().sequence());
+                }
+            }
+            RoleChangeAction::Revoke => {
+                members = Self::remove_address_from_vec(&env, &members, &proposal.target);
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::HasRole(proposal.role, proposal.target.clone()));
+                if proposal.role == Role::Operator {
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::Operator(proposal.target.clone()), &false);
+                    let ops = Self::get_operator_list(&env);
+                    let new_ops = Self::remove_address_from_vec(&env, &ops, &proposal.target);
+                    env.storage().instance().set(&DataKey::OperatorList, &new_ops);
+                    env.storage().instance().set(&DataKey::OperatorCount, &new_ops.len());
+                }
+            }
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::RoleMembers(proposal.role), &members);
+
+        proposal.executed = true;
+        env.storage()
+            .instance()
+            .set(&DataKey::RoleChangeProposal(id), &proposal);
+
+        RoleChangedEvent {
+            version: EVENT_VERSION,
+            target: proposal.target,
+            role: proposal.role,
+            action: proposal.action,
+            by: admin,
+            ledger: env.ledger().sequence(),
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn cancel_role_change(env: Env, caller: Address, id: u64) -> Result<(), Error> {
+        caller.require_auth();
+        let admin = Self::require_admin(&env)?;
+        if caller != admin {
+            return Err(Error::Unauthorized);
+        }
+
+        let mut proposal: RoleChangeProposal = env
+            .storage()
+            .instance()
+            .get(&DataKey::RoleChangeProposal(id))
+            .ok_or(Error::ProposalNotFound)?;
+
+        if proposal.executed {
+            return Err(Error::ProposalAlreadyExecuted);
+        }
+        if proposal.cancelled {
+            return Err(Error::ProposalCancelled);
+        }
+
+        proposal.cancelled = true;
+        env.storage()
+            .instance()
+            .set(&DataKey::RoleChangeProposal(id), &proposal);
+
+        RoleChangeCancelledEvent {
+            version: EVENT_VERSION,
+            id,
+            by: caller,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn get_role_proposal(env: Env, id: u64) -> Option<RoleChangeProposal> {
+        env.storage().instance().get(&DataKey::RoleChangeProposal(id))
+    }
+
+    pub fn has_role(env: Env, account: Address, role: Role) -> bool {
+        match role {
+            Role::Admin => {
+                let admin: Option<Address> = env.storage().instance().get(&DataKey::Admin);
+                if admin == Some(account.clone()) {
+                    return true;
+                }
+                env.storage()
+                    .persistent()
+                    .get::<_, bool>(&DataKey::HasRole(role, account))
+                    .unwrap_or(false)
+            }
+            Role::Operator => {
+                if env
+                    .storage()
+                    .instance()
+                    .get::<_, bool>(&DataKey::Operator(account.clone()))
+                    .unwrap_or(false)
+                {
+                    return true;
+                }
+                env.storage()
+                    .persistent()
+                    .get::<_, bool>(&DataKey::HasRole(role, account))
+                    .unwrap_or(false)
+            }
+            Role::Auditor => env
+                .storage()
+                .persistent()
+                .get::<_, bool>(&DataKey::HasRole(role, account))
+                .unwrap_or(false),
+        }
+    }
+
+    pub fn get_role_member_count(env: Env, role: Role) -> u32 {
+        Self::get_role_members_internal(&env, role).len()
+    }
+
+    pub fn get_role_members(env: Env, role: Role, start_index: u32, limit: u32) -> Vec<Address> {
+        let members = Self::get_role_members_internal(&env, role);
+        let total = members.len();
+        let mut result = Vec::new(&env);
+        if start_index >= total || limit == 0 {
+            return result;
+        }
+        let bounded_limit = limit.min(50);
+        let end = (start_index.saturating_add(bounded_limit)).min(total);
+        for i in start_index..end {
+            result.push_back(members.get(i).unwrap());
+        }
+        result
+    }
+
+    pub fn execute_payout(
+        env: Env,
+        caller: Address,
+        request_id: u64,
+        partial_amount: Option<i128>,
+        expected_price: i128,
+        max_slippage: u32,
+        nonce: u64,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        if !Self::has_role(env.clone(), caller.clone(), Role::Operator) {
+            return Err(Error::Unauthorized);
+        }
+        Self::execute_withdrawal(env, request_id, partial_amount, expected_price, max_slippage, nonce)
+    }
+
+    pub fn audit_view_contract_state(env: Env, auditor: Address) -> Result<ConfigSnapshot, Error> {
+        auditor.require_auth();
+        if !Self::has_role(env.clone(), auditor.clone(), Role::Auditor)
+            && !Self::has_role(env.clone(), auditor.clone(), Role::Admin)
+        {
+            return Err(Error::Unauthorized);
+        }
+        Self::get_config_snapshot(env)
+    }
+
+    fn get_role_members_internal(env: &Env, role: Role) -> Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RoleMembers(role))
+            .unwrap_or_else(|| {
+                let mut v = Vec::new(env);
+                match role {
+                    Role::Admin => {
+                        if let Some(admin) = env.storage().instance().get::<_, Address>(&DataKey::Admin) {
+                            v.push_back(admin);
+                        }
+                    }
+                    Role::Operator => {
+                        let ops = Self::get_operator_list(env);
+                        for op in ops.iter() {
+                            v.push_back(op);
+                        }
+                    }
+                    Role::Auditor => {}
+                }
+                v
+            })
+    }
+
+    fn remove_address_from_vec(env: &Env, list: &Vec<Address>, target: &Address) -> Vec<Address> {
+        let mut result = Vec::new(env);
+        for item in list.iter() {
+            if item != *target {
+                result.push_back(item);
+            }
+        }
+        result
+    }
+
+    // ── Issue #21: Bounded Operator Heartbeat & Pruning ───────────────────
+
+    pub fn prune_inactive_operators_bounded(env: Env, batch_size: u32) -> Result<PruneBatchResult, Error> {
+        let _admin = Self::require_admin(&env)?;
+        let max_batch = 50u32;
+        let batch_size = if batch_size == 0 {
+            1
+        } else if batch_size > max_batch {
+            max_batch
+        } else {
+            batch_size
+        };
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::InactivityThreshold)
+            .unwrap_or(DEFAULT_INACTIVITY_THRESHOLD);
+        let current_ledger = env.ledger().sequence();
+        let operators = Self::get_operator_list(&env);
+        let total_ops = operators.len();
+        if total_ops == 0 {
+            return Ok(PruneBatchResult {
+                processed: 0,
+                pruned: 0,
+                next_cursor: 0,
+                is_complete: true,
+            });
+        }
+
+        let mut cursor: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::OperatorPruneCursor)
+            .unwrap_or(0);
+        if cursor >= total_ops {
+            cursor = 0;
+        }
+
+        let end = (cursor + batch_size).min(total_ops);
+        let mut pruned_count = 0u32;
+        let mut processed_count = 0u32;
+
+        for i in cursor..end {
+            processed_count += 1;
+            let operator = operators.get(i).unwrap();
+            let is_active = env
+                .storage()
+                .instance()
+                .get::<_, bool>(&DataKey::Operator(operator.clone()))
+                .unwrap_or(false);
+            if !is_active {
+                continue;
+            }
+
+            let heartbeat = env
+                .storage()
+                .instance()
+                .get::<_, u32>(&DataKey::OperatorHeartbeat(operator.clone()));
+            let registered_at = env
+                .storage()
+                .instance()
+                .get::<_, u32>(&DataKey::OperatorRegisteredAt(operator.clone()));
+            let is_inactive = match heartbeat {
+                Some(last) => current_ledger.saturating_sub(last) > threshold,
+                None => match registered_at {
+                    Some(reg) => current_ledger.saturating_sub(reg) > threshold,
+                    None => true,
+                },
+            };
+
+            if is_inactive {
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Operator(operator.clone()), &false);
+                OperatorPrunedEvent {
+                    version: EVENT_VERSION,
+                    operator: operator.clone(),
+                    ledger: current_ledger,
+                }
+                .publish(&env);
+                pruned_count += 1;
+            }
+        }
+
+        let next_cursor = if end >= total_ops {
+            0
+        } else {
+            end
+        };
+        let is_complete = next_cursor == 0;
+
+        if is_complete {
+            let mut retained = Vec::new(&env);
+            for op in operators.iter() {
+                if env
+                    .storage()
+                    .instance()
+                    .get::<_, bool>(&DataKey::Operator(op.clone()))
+                    .unwrap_or(false)
+                {
+                    retained.push_back(op);
+                }
+            }
+            env.storage().instance().set(&DataKey::OperatorList, &retained);
+            env.storage()
+                .instance()
+                .set(&DataKey::OperatorCount, &retained.len());
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::OperatorPruneCursor, &next_cursor);
+
+        Ok(PruneBatchResult {
+            processed: processed_count,
+            pruned: pruned_count,
+            next_cursor,
+            is_complete,
+        })
+    }
+
+    pub fn get_operator_prune_cursor(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::OperatorPruneCursor)
+            .unwrap_or(0)
+    }
+
+    // ── Issue #22: Ledger-Window Rate Limits ──────────────────────────────
+
+    pub fn set_rate_limit(env: Env, operation: Symbol, limit: u32) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::RateLimit(operation.clone()), &limit);
+        RateLimitConfiguredEvent {
+            version: EVENT_VERSION,
+            operation,
+            limit,
+            by: admin,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    pub fn set_deposit_rate_limit(env: Env, limit: u32) -> Result<(), Error> {
+        Self::set_rate_limit(env.clone(), Symbol::new(&env, "deposit"), limit)
+    }
+
+    pub fn set_max_deposits_per_block(env: Env, limit: u32) -> Result<(), Error> {
+        Self::set_deposit_rate_limit(env, limit)
+    }
+
+    pub fn set_withdraw_req_rate_limit(env: Env, limit: u32) -> Result<(), Error> {
+        Self::set_rate_limit(env.clone(), Symbol::new(&env, "withdrawal_request"), limit)
+    }
+
+    pub fn set_withdraw_exec_rate_limit(env: Env, limit: u32) -> Result<(), Error> {
+        Self::set_rate_limit(env.clone(), Symbol::new(&env, "withdrawal_execution"), limit)
+    }
+
+    pub fn get_rate_limit(env: Env, operation: Symbol) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::RateLimit(operation))
+            .unwrap_or(0)
+    }
+
+    pub fn get_rate_limit_usage(env: Env, operation: Symbol) -> RateLimitUsage {
+        let limit = Self::get_rate_limit(env.clone(), operation.clone());
+        let current_ledger = env.ledger().sequence();
+        let (stored_ledger, count): (u32, u32) = env
+            .storage()
+            .instance()
+            .get(&DataKey::RateLimitCounter(operation.clone()))
+            .unwrap_or((0, 0));
+        let current_count = if stored_ledger == current_ledger { count } else { 0 };
+        RateLimitUsage {
+            operation,
+            ledger: current_ledger,
+            current_count,
+            limit,
+        }
+    }
+
+    pub fn get_rate_limit_retry_timing(env: Env, operation: Symbol) -> Option<RateLimitRetryTiming> {
+        let usage = Self::get_rate_limit_usage(env, operation);
+        if usage.limit > 0 && usage.current_count >= usage.limit {
+            Some(RateLimitRetryTiming {
+                current_ledger: usage.ledger,
+                retry_after_ledger: usage.ledger + 1,
+                wait_ledgers: 1,
+                current_count: usage.current_count,
+                limit: usage.limit,
+            })
+        } else {
+            None
+        }
+    }
+
+    fn check_and_increment_rate_limit(env: &Env, operation: Symbol) -> Result<(), Error> {
+        let limit: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RateLimit(operation.clone()))
+            .unwrap_or(0);
+        if limit == 0 {
+            return Ok(());
+        }
+
+        let current_ledger = env.ledger().sequence();
+        let (stored_ledger, mut count): (u32, u32) = env
+            .storage()
+            .instance()
+            .get(&DataKey::RateLimitCounter(operation.clone()))
+            .unwrap_or((0, 0));
+
+        if stored_ledger != current_ledger {
+            count = 0;
+        }
+
+        if count >= limit {
+            RateLimitExceededEvent {
+                version: EVENT_VERSION,
+                operation: operation.clone(),
+                current_ledger,
+                retry_after_ledger: current_ledger + 1,
+                current_count: count,
+                limit,
+            }
+            .publish(env);
+            if operation == Symbol::new(env, "deposit") {
+                return Err(Error::DepositRateLimitExceeded);
+            } else {
+                return Err(Error::RateLimitExceeded);
+            }
+        }
+
+        let new_count = count.checked_add(1).ok_or(Error::Overflow)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::RateLimitCounter(operation), &(current_ledger, new_count));
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -5535,3 +6891,9 @@ mod test_denylist_invariants;
 
 #[cfg(test)]
 mod test_token_allowlist_invariants;
+
+#[cfg(test)]
+mod test_cancellation_lifecycle_invariants;
+
+#[cfg(test)]
+mod test_escrow_solvency_proptest;

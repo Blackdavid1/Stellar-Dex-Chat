@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import crypto from 'crypto';
 import * as Sentry from '@sentry/nextjs';
 import { getPayoutProvider } from '@/lib/payout/providers/registry';
 import { credentialManager } from '@/lib/payout/credentialManager';
@@ -12,6 +13,8 @@ import { telemetry } from '@/lib/telemetry';
 import { applyRateLimit, getClientIp } from '@/lib/rateLimit';
 import { setTransferStatus, getTransferStatus } from '@/lib/transferStore';
 import { initiateTransferSchema } from '@/lib/apiSchemas';
+import { payoutAuditLedger } from '@/lib/payout/auditLedger';
+import { payoutRetryQueue } from '@/lib/payout/retryQueue';
 
 const RATE_LIMIT = { maxRequests: 3, windowMs: 60_000 };
 
@@ -21,51 +24,21 @@ const idempotencyCache = new Map<
 >();
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
 
+export async function OPTIONS(request: NextRequest) {
+  return (
+    enforcePayoutRouteSecurity(request) ||
+    new NextResponse(null, { status: 204 })
+  );
+}
+
 export async function POST(request: NextRequest) {
+  // Enforce payout API security
+  const securityBlocked = enforcePayoutRouteSecurity(request);
+  if (securityBlocked) return securityBlocked;
+
   const ip = getClientIp(request);
   const limited = applyRateLimit(ip, '/api/initiate-transfer', RATE_LIMIT);
   if (limited) return limited;
-
-  const idempotencyKey = request.headers.get('X-Idempotency-Key');
-  if (!idempotencyKey) {
-    return NextResponse.json(
-      { success: false, message: 'X-Idempotency-Key header is required' },
-      { status: 400 },
-    );
-  }
-
-  // Idempotency check: if transfer was already executed or recorded, return cached/existing record
-  // to prevent blind duplicate initiation.
-  const cached = idempotencyCache.get(idempotencyKey);
-  if (cached && Date.now() - cached.timestamp < IDEMPOTENCY_TTL_MS) {
-    return NextResponse.json({ success: true, data: cached.result });
-  }
-
-  const existingRecord = getTransferStatus(idempotencyKey);
-  if (existingRecord) {
-    if (
-      existingRecord.timeoutOutcome === 'ambiguous' &&
-      !existingRecord.reconciled
-    ) {
-      // Reconcile ambiguous outcome rather than blindly retrying
-      const recon = await reconcileAmbiguousInitiation(
-        idempotencyKey,
-        existingRecord.credentialVersion,
-      );
-      if (recon.reconciled && recon.record) {
-        idempotencyCache.set(idempotencyKey, {
-          result: recon.record,
-          timestamp: Date.now(),
-        });
-        return NextResponse.json({
-          success: true,
-          data: recon.record,
-          reconciled: true,
-        });
-      }
-    }
-    return NextResponse.json({ success: true, data: existingRecord });
-  }
 
   const traceContext = telemetry.extractTraceFromHeaders(request.headers);
   const span = telemetry.createSpan(
@@ -127,153 +100,140 @@ export async function POST(request: NextRequest) {
     const activeCred = credentialManager.getActiveCredential();
     const credentialVersion = activeCred?.version || 'v1';
 
+    // Idempotency key from header, body reference, or generated fallback
+    const headerIdempotencyKey = request.headers.get('X-Idempotency-Key');
+    const idempotencyKey =
+      headerIdempotencyKey ||
+      (typeof bodyRecord.reference === 'string' && bodyRecord.reference
+        ? bodyRecord.reference
+        : null) ||
+      `idem_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+
+    const cached = idempotencyCache.get(idempotencyKey);
+    if (cached && Date.now() - cached.timestamp < IDEMPOTENCY_TTL_MS) {
+      return NextResponse.json({ success: true, data: cached.result });
+    }
+
     telemetry.addLog(span.spanId, 'info', 'Request validated', {
       hasSource: !!source,
       hasAmount: !!amount,
       hasRecipient: !!recipient,
       amount: amount,
-      ...credentialManager.logContext(credentialVersion),
+      idempotencyKey,
+    });
+
+    // Record immutable audit event for payout initiation (Issue #38)
+    payoutAuditLedger.recordEvent({
+      payoutId: idempotencyKey,
+      action: 'payout_initiated',
+      actor: clientSessionId ? `client:${clientSessionId}` : 'client:user',
+      requestCorrelationId: traceContext.traceId,
+      providerReference: idempotencyKey,
+      metadata: {
+        source,
+        reason,
+        amount: Number(amount),
+        recipient,
+      },
     });
 
     const provider = getPayoutProvider();
-    let data: Record<string, unknown>;
 
     try {
-      data = await provider.initiateTransfer({
+      const data = await provider.initiateTransfer({
         source,
         reason,
-        amount,
+        amount: Number(amount),
         recipient,
         reference: idempotencyKey,
-        credentialVersion,
       });
-    } catch (initiateError: unknown) {
-      // Handle Ambiguous Initiation (response timeout / connection drop after handshake)
-      if (
-        initiateError instanceof AmbiguousInitiationError ||
-        (initiateError instanceof ProviderTimeoutError &&
-          initiateError.outcome === 'ambiguous')
-      ) {
-        telemetry.addLog(
-          span.spanId,
-          'warn',
-          'Transfer initiation ambiguous - persisting status and reconciling',
-          {
-            reference: idempotencyKey,
-            ...credentialManager.logContext(credentialVersion),
-          },
-        );
 
-        // 1. Persist ambiguous outcome immediately
+      const transferReference =
+        typeof data.reference === 'string' && data.reference
+          ? data.reference
+          : idempotencyKey;
+
+      if (transferReference) {
         setTransferStatus({
-          reference: idempotencyKey,
+          reference: transferReference,
           status: 'pending',
           amount: Number(amount),
           updatedAt: new Date().toISOString(),
           clientSessionId,
-          credentialVersion,
-          timeoutOutcome: 'ambiguous',
-          reconciled: false,
-          lastError: 'Initiation timed out during response phase',
         });
-
-        // 2. Attempt immediate reconciliation query against provider status
-        const recon = await reconcileAmbiguousInitiation(
-          idempotencyKey,
-          credentialVersion,
-        );
-
-        if (recon.reconciled && recon.record) {
-          idempotencyCache.set(idempotencyKey, {
-            result: recon.record,
-            timestamp: Date.now(),
-          });
-          telemetry.finishSpan(span.spanId, {
-            success: true,
-            reconciled: true,
-          });
-          return NextResponse.json({
-            success: true,
-            data: recon.record,
-            reconciled: true,
-          });
-        }
-
-        // Return stable safe error with sanitized diagnostics
-        const sanitized = sanitizeProviderError(
-          initiateError,
-          'initiate',
-          idempotencyKey,
-        );
-        telemetry.finishSpan(span.spanId, {
-          success: false,
-          error: sanitized.message,
-          errorType: sanitized.code,
-        });
-
-        return NextResponse.json(sanitized, { status: 504 });
       }
 
-      // Handle Known / Rejected Provider Timeout (connect phase stall before request dispatch)
-      if (initiateError instanceof ProviderTimeoutError) {
-        setTransferStatus({
-          reference: idempotencyKey,
-          status: 'failed',
+      // Record successful provider acceptance in audit ledger
+      payoutAuditLedger.recordEvent({
+        payoutId: transferReference,
+        action: 'payout_provider_accepted',
+        actor: 'provider:paystack',
+        requestCorrelationId: traceContext.traceId,
+        providerReference: transferReference,
+        metadata: { data: data as Record<string, unknown> },
+      });
+
+      idempotencyCache.set(idempotencyKey, {
+        result: data,
+        timestamp: Date.now(),
+      });
+
+      return NextResponse.json({
+        success: true,
+        data,
+      });
+    } catch (providerError: unknown) {
+      const errorMessage =
+        providerError instanceof Error
+          ? providerError.message
+          : 'Unknown provider error';
+
+      // Enqueue into durable retry queue instead of losing payout intent (Issue #37)
+      const retryJob = payoutRetryQueue.enqueueJob({
+        payoutId: idempotencyKey,
+        idempotencyKey,
+        payload: {
+          source,
           amount: Number(amount),
-          updatedAt: new Date().toISOString(),
-          clientSessionId,
-          credentialVersion,
-          timeoutOutcome: 'rejected',
-          reconciled: true,
-          failureReason:
-            'Provider connection timed out before request dispatch',
-        });
+          recipient,
+          reason,
+        },
+        error: errorMessage,
+        correlationId: traceContext.traceId,
+      });
 
-        const sanitized = sanitizeProviderError(
-          initiateError,
-          'initiate',
-          idempotencyKey,
-        );
-        telemetry.finishSpan(span.spanId, {
-          success: false,
-          error: sanitized.message,
-          errorType: sanitized.code,
-        });
-
-        return NextResponse.json(sanitized, { status: 504 });
-      }
-
-      throw initiateError;
-    }
-
-    const transferReference =
-      typeof data.reference === 'string' && data.reference
-        ? data.reference
-        : idempotencyKey;
-
-    if (transferReference) {
       setTransferStatus({
-        reference: transferReference,
+        reference: idempotencyKey,
         status: 'pending',
         amount: Number(amount),
-        updatedAt: new Date().toISOString(),
+        updatedAt: new Date(now).toISOString(),
+        updatedAtMs: now,
         clientSessionId,
-        credentialVersion:
-          (data.credentialVersion as string) || credentialVersion,
-        timeoutOutcome: 'known',
-        reconciled: true,
+        failureReason: `Transient error: ${errorMessage}. Queued for retry.`,
       });
+
+      telemetry.addLog(
+        span.spanId,
+        'warn',
+        'Provider call failed; enqueued into retry queue',
+        {
+          jobId: retryJob.id,
+          idempotencyKey,
+          error: errorMessage,
+        },
+      );
+
+      return NextResponse.json(
+        {
+          success: true,
+          status: 'queued_for_retry',
+          reference: idempotencyKey,
+          jobId: retryJob.id,
+          message: 'Transfer queued for retry due to provider failure',
+        },
+        { status: 202 },
+      );
     }
-
-    idempotencyCache.set(idempotencyKey, {
-      result: data,
-      timestamp: Date.now(),
-    });
-
-    return NextResponse.json({
-      success: true,
-      data,
-    });
   } catch (error: unknown) {
     Sentry.captureException(error, {
       tags: {
@@ -298,12 +258,19 @@ export async function POST(request: NextRequest) {
 
     console.error('Initiate transfer error:', error);
 
+    const errorDetails = handlePayoutApiError(
+      error,
+      'Failed to initiate transfer. Please try again.',
+    );
+
     telemetry.finishSpan(span.spanId, {
       success: false,
-      error: sanitized.message,
-      errorType: sanitized.code,
+      error: errorDetails.body.message,
     });
 
-    return NextResponse.json(sanitized, { status: 500 });
+    return NextResponse.json(errorDetails.body, {
+      status: errorDetails.status,
+      headers: errorDetails.headers,
+    });
   }
 }

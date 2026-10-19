@@ -3,16 +3,26 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getPayoutProvider } from '@/lib/payout/providers/registry';
 import { applyRateLimit, getClientIp } from '@/lib/rateLimit';
 import { transferStatusSchema } from '@/lib/apiSchemas';
+import { enforcePayoutRouteSecurity } from '@/lib/payout/security';
 import {
-  authorizeTransferAccess,
-  uniformNotFoundResponse,
-} from '@/lib/auth/authorizationMatrix';
-import { setTransferStatus } from '@/lib/transferStore';
-import { sanitizeProviderError } from '@/lib/payout/timeoutBudget';
+  getProviderCircuitBreaker,
+  handlePayoutApiError,
+} from '@/lib/payout/circuitBreaker';
 
 const RATE_LIMIT = { maxRequests: 10, windowMs: 60_000 };
 
+export async function OPTIONS(request: NextRequest) {
+  return (
+    enforcePayoutRouteSecurity(request) ||
+    new NextResponse(null, { status: 204 })
+  );
+}
+
 export async function POST(request: NextRequest) {
+  // Enforce payout API security
+  const securityBlocked = enforcePayoutRouteSecurity(request);
+  if (securityBlocked) return securityBlocked;
+
   const ip = getClientIp(request);
   const limited = applyRateLimit(ip, '/api/transfer-status', RATE_LIMIT);
   if (limited) return limited;
@@ -56,32 +66,11 @@ export async function POST(request: NextRequest) {
     }
 
     const provider = getPayoutProvider();
-    const data = await provider.checkTransferStatus({
-      reference,
-      credentialVersion: auth.record?.credentialVersion,
-    });
+    const breaker = getProviderCircuitBreaker(provider.name);
 
-    if (auth.record && typeof data.status === 'string') {
-      const statusLower = data.status.toLowerCase();
-      const validStatuses = [
-        'pending',
-        'success',
-        'failed',
-        'reversed',
-        'cancelled',
-      ] as const;
-      const isValidStatus = (s: string): s is (typeof validStatuses)[number] =>
-        (validStatuses as readonly string[]).includes(s);
-      const nextStatus = isValidStatus(statusLower)
-        ? statusLower
-        : auth.record.status;
-
-      setTransferStatus({
-        ...auth.record,
-        status: nextStatus,
-        updatedAt: new Date().toISOString(),
-      });
-    }
+    const data = await breaker.execute(() =>
+      provider.checkTransferStatus({ reference }),
+    );
 
     return NextResponse.json({
       success: true,
@@ -90,31 +79,14 @@ export async function POST(request: NextRequest) {
   } catch (error: unknown) {
     console.error('Transfer status error:', error);
 
-    const sanitized = sanitizeProviderError(error, 'status');
-    if (sanitized.code === 'PROVIDER_TIMEOUT') {
-      return NextResponse.json(sanitized, { status: 504 });
-    }
+    const errorDetails = handlePayoutApiError(
+      error,
+      'Failed to fetch transfer status. Please try again.',
+    );
 
-    if (
-      error &&
-      typeof error === 'object' &&
-      'response' in error &&
-      error.response &&
-      typeof error.response === 'object' &&
-      'data' in error.response &&
-      error.response.data &&
-      typeof error.response.data === 'object' &&
-      'message' in error.response.data
-    ) {
-      return NextResponse.json(
-        {
-          success: false,
-          message: (error.response.data as { message: string }).message,
-        },
-        { status: 400 },
-      );
-    }
-
-    return NextResponse.json(sanitized, { status: 500 });
+    return NextResponse.json(errorDetails.body, {
+      status: errorDetails.status,
+      headers: errorDetails.headers,
+    });
   }
 }
