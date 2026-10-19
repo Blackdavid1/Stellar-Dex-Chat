@@ -56,7 +56,17 @@ export interface TransferStatusRecord {
   amount: number;
   failureReason?: string;
   updatedAt: string;
+  updatedAtMs?: number;
   clientSessionId?: string;
+  reconciliationAttempts?: number;
+  lastReconciledAt?: string;
+  lastReconciliationResult?:
+    | 'transitioned'
+    | 'no_change'
+    | 'provider_unavailable'
+    | 'invalid_transition'
+    | 'error';
+  nextRetryAt?: number;
 }
 
 // Key is the transfer reference
@@ -69,4 +79,12 @@ export function getTransferStatus(reference: string) {
 export function setTransferStatus(record: TransferStatusRecord) {
   transferStore.set(record.reference, record);
   return record;
+}
+
+export function getAllTransfers(): TransferStatusRecord[] {
+  return Array.from(transferStore.values());
+}
+
+export function clearTransferStore(): void {
+  transferStore.clear();
 }

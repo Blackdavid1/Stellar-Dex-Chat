@@ -1,9 +1,13 @@
 import { z } from 'zod';
+import { parseAssetAmount } from './exactAmount';
 
 export const transactionAmountSchema = z.object({
   amount: z.union([
     z.number().positive('Amount must be positive'),
-    z.string().refine((val) => !isNaN(parseFloat(val)) && parseFloat(val) > 0, {
+    z.string().refine((val) => {
+      const res = parseAssetAmount(val);
+      return res.success && res.stroops > 0n;
+    }, {
       message: 'Amount must be a positive number',
     }),
   ]),

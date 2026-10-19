@@ -17,14 +17,15 @@ import {
   requestAccess,
   setAllowed,
 } from '@stellar/freighter-api';
+import { fetchXlmBalance } from '@/lib/stellarContract';
 
 /** Canonical Stellar testnet passphrase — avoids importing the full SDK at module scope. */
-const TESTNET_PASSPHRASE = 'Test SDF Network ; September 2015';
+export const TESTNET_PASSPHRASE = 'Test SDF Network ; September 2015';
 
-const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
-const STORAGE_KEY_ADDRESS = 'stellar_address';
-const STORAGE_KEY_INDEX = 'stellar_selected_account_index';
-const STORAGE_KEY_TIMESTAMP = 'stellar_connection_timestamp';
+export const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+export const STORAGE_KEY_ADDRESS = 'stellar_address';
+export const STORAGE_KEY_INDEX = 'stellar_selected_account_index';
+export const STORAGE_KEY_TIMESTAMP = 'stellar_connection_timestamp';
 
 export const EXPECTED_NETWORK = 'TESTNET';
 
@@ -85,6 +86,8 @@ interface StellarWalletContextType {
   clearSessionExpired: () => void;
   mockConnect?: (address: string) => void;
   isNetworkMismatch: boolean;
+  reconnect: () => Promise<void>;
+  verifySession: () => Promise<boolean>;
   refreshXlmBalance: () => Promise<void>;
 }
 
@@ -171,8 +174,6 @@ export function StellarWalletProvider({ children }: { children: ReactNode }) {
               network: netResult.network || 'TESTNET',
               networkPassphrase: netResult.networkPassphrase || '',
             });
-            import('@/lib/stellarContract')
-              .then(({ fetchXlmBalance }) => fetchXlmBalance(addrResult.address))
             fetchXlmBalance(addrResult.address)
               .then(setXlmBalance)
               .catch(() => { });
@@ -233,8 +234,6 @@ export function StellarWalletProvider({ children }: { children: ReactNode }) {
         network: netResult.network || 'TESTNET',
         networkPassphrase: passphrase,
       });
-      import('@/lib/stellarContract')
-        .then(({ fetchXlmBalance }) => fetchXlmBalance(addr))
       fetchXlmBalance(addr)
         .then(setXlmBalance)
         .catch(() => { });
@@ -258,6 +257,23 @@ export function StellarWalletProvider({ children }: { children: ReactNode }) {
       if (cancelled || syncing) return;
       syncing = true;
       try {
+        const storedTimestamp = localStorage.getItem(STORAGE_KEY_TIMESTAMP);
+        const connectionTime = storedTimestamp
+          ? parseInt(storedTimestamp, 10)
+          : 0;
+        const now = Date.now();
+        if (connectionTime > 0 && now - connectionTime > SESSION_TTL_MS) {
+          localStorage.removeItem(STORAGE_KEY_ADDRESS);
+          localStorage.removeItem(STORAGE_KEY_INDEX);
+          localStorage.removeItem(STORAGE_KEY_TIMESTAMP);
+          setSessionExpired(true);
+          setConnection(defaultConnection);
+          setAccounts([]);
+          setSelectedAccountIndex(0);
+          setXlmBalance('');
+          return;
+        }
+
         const [addressResult, networkResult, accountsResult] =
           await Promise.all([getAddress(), getNetwork(), getFreighterAccounts()]);
         if (cancelled) return;
@@ -322,7 +338,7 @@ export function StellarWalletProvider({ children }: { children: ReactNode }) {
           localStorage.setItem(STORAGE_KEY_ADDRESS, address);
           localStorage.setItem(STORAGE_KEY_TIMESTAMP, String(Date.now()));
           fetchXlmBalance(address)
-            .then((balance) => {
+            .then((balance: string) => {
               if (!cancelled && activeAddress === address) {
                 setXlmBalance(balance);
               }
@@ -362,12 +378,33 @@ export function StellarWalletProvider({ children }: { children: ReactNode }) {
         throw new Error('Wallet is not connected');
       }
 
+      // Pre-flight check: verify session has not expired
+      const storedTimestamp = localStorage.getItem(STORAGE_KEY_TIMESTAMP);
+      const connectionTime = storedTimestamp
+        ? parseInt(storedTimestamp, 10)
+        : 0;
+      const now = Date.now();
+      if (
+        sessionExpired ||
+        (connectionTime > 0 && now - connectionTime > SESSION_TTL_MS)
+      ) {
+        setSessionExpired(true);
+        setConnection(defaultConnection);
+        localStorage.removeItem(STORAGE_KEY_ADDRESS);
+        localStorage.removeItem(STORAGE_KEY_INDEX);
+        localStorage.removeItem(STORAGE_KEY_TIMESTAMP);
+        throw new Error('Wallet session expired. Please reconnect to continue.');
+      }
+
       const [addressResult, networkResult] = await Promise.all([
         getAddress(),
         getNetwork(),
       ]);
       if (addressResult.error || !addressResult.address) {
-        throw new Error('Unable to verify the active Freighter account');
+        setConnection((prev) => ({ ...prev, isConnected: false }));
+        throw new Error(
+          'Wallet connection lost or authorization expired. Please reconnect.',
+        );
       }
 
       const network = networkResult.network || '';
@@ -375,7 +412,7 @@ export function StellarWalletProvider({ children }: { children: ReactNode }) {
       const address = addressResult.address;
       if (
         address !== connection.address ||
-        networkPassphrase !== Networks.TESTNET
+        networkPassphrase !== TESTNET_PASSPHRASE
       ) {
         setConnection((previous) => ({
           ...previous,
@@ -390,7 +427,7 @@ export function StellarWalletProvider({ children }: { children: ReactNode }) {
             .catch(() => {});
         }
         throw new Error(
-          networkPassphrase !== Networks.TESTNET
+          networkPassphrase !== TESTNET_PASSPHRASE
             ? 'Please switch Freighter to Testnet'
             : 'Freighter account changed. Please retry the transaction.',
         );
@@ -403,7 +440,7 @@ export function StellarWalletProvider({ children }: { children: ReactNode }) {
       if (result.error) throw new Error(String(result.error));
       return result.signedTxXdr;
     },
-    [connection.address, connection.isConnected],
+    [connection.address, connection.isConnected, sessionExpired],
   );
 
   const selectAccount = useCallback(
@@ -421,8 +458,6 @@ export function StellarWalletProvider({ children }: { children: ReactNode }) {
         }));
         localStorage.setItem(STORAGE_KEY_ADDRESS, selectedAccount.address);
         localStorage.setItem(STORAGE_KEY_TIMESTAMP, String(Date.now()));
-        import('@/lib/stellarContract')
-          .then(({ fetchXlmBalance }) => fetchXlmBalance(selectedAccount.address))
         fetchXlmBalance(selectedAccount.address)
           .then(setXlmBalance)
           .catch(() => { });
@@ -438,6 +473,27 @@ export function StellarWalletProvider({ children }: { children: ReactNode }) {
   const clearSessionExpired = useCallback(() => {
     setSessionExpired(false);
   }, []);
+
+  const reconnect = useCallback(async () => {
+    await connect();
+  }, [connect]);
+
+  const verifySession = useCallback(async (): Promise<boolean> => {
+    if (!connection.isConnected) return false;
+    const storedTimestamp = localStorage.getItem(STORAGE_KEY_TIMESTAMP);
+    const connectionTime = storedTimestamp
+      ? parseInt(storedTimestamp, 10)
+      : 0;
+    if (connectionTime > 0 && Date.now() - connectionTime > SESSION_TTL_MS) {
+      setSessionExpired(true);
+      setConnection(defaultConnection);
+      return false;
+    }
+    const isConn = await freighterIsConnected().catch(() => ({
+      isConnected: false,
+    }));
+    return Boolean(isConn.isConnected);
+  }, [connection.isConnected]);
 
   const refreshXlmBalance = useCallback(async () => {
     if (!connection.address) return;
@@ -474,7 +530,7 @@ export function StellarWalletProvider({ children }: { children: ReactNode }) {
 
   const isNetworkMismatch =
     connection.isConnected &&
-    connection.networkPassphrase !== Networks.TESTNET;
+    connection.networkPassphrase !== TESTNET_PASSPHRASE;
 
   const contextValue = useMemo(
     () => ({
@@ -491,6 +547,8 @@ export function StellarWalletProvider({ children }: { children: ReactNode }) {
       error,
       sessionExpired,
       clearSessionExpired,
+      reconnect,
+      verifySession,
       ...(mockWalletEnabled ? { mockConnect } : {}),
       isNetworkMismatch,
       refreshXlmBalance,
@@ -509,6 +567,8 @@ export function StellarWalletProvider({ children }: { children: ReactNode }) {
       error,
       sessionExpired,
       clearSessionExpired,
+      reconnect,
+      verifySession,
       mockConnect,
       mockWalletEnabled,
       isNetworkMismatch,

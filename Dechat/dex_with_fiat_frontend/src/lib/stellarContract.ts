@@ -11,7 +11,10 @@ import {
 } from '@stellar/stellar-sdk';
 import { stroopsToXlm } from '@/lib/stroops';
 import { clientEnv as env } from '@/lib/clientEnv';
-import { FiatBridgeContractClient, mapContractError } from '@/contracts';
+import {
+  withResilientRpcRead,
+  assertWriteNetworkPinning,
+} from '@/lib/resilientRpc';
 
 export { mapContractError } from '@/contracts';
 export { stroopsToXlm as stroopsToDisplay } from '@/lib/stroops';
@@ -260,6 +263,68 @@ export async function simulateWithdraw(
   return feeEstimate;
 }
 
+export interface PreSignSimulationResult {
+  contractId: string;
+  operation: 'deposit' | 'withdraw';
+  token: string;
+  amountStroops: bigint;
+  amountFormatted: string;
+  feeEstimate: FeeEstimate | null;
+  network: string;
+  account: string;
+  recipient?: string;
+  expectedEffects: string[];
+  simulationTimestamp: number;
+}
+
+/**
+ * Simulates the exact transaction payload and produces decoded human-readable
+ * operations, fee breakdowns, and expected on-chain effects for pre-sign review.
+ */
+export async function simulateTransactionPayload(params: {
+  operation: 'deposit' | 'withdraw';
+  account: string;
+  amount: bigint;
+  recipient?: string;
+  network?: string;
+}): Promise<PreSignSimulationResult> {
+  const { operation, account, amount, recipient, network = NETWORK_PASSPHRASE } = params;
+  let feeEstimate: FeeEstimate | null = null;
+  if (operation === 'deposit') {
+    feeEstimate = await simulateDeposit(account, amount);
+  } else {
+    const to = recipient || account;
+    feeEstimate = await simulateWithdraw(account, to, amount);
+  }
+
+  const { formatAssetAmount } = await import('@/lib/exactAmount');
+  const amountFormatted = formatAssetAmount(amount, { decimals: 7 });
+  const effects: string[] = [];
+  if (operation === 'deposit') {
+    effects.push(`Transfer ${amountFormatted} XLM from ${account.slice(0, 6)}...${account.slice(-4)} to Bridge Escrow Contract`);
+  } else {
+    const to = recipient || account;
+    effects.push(`Transfer ${amountFormatted} XLM from Bridge Escrow Contract to ${to.slice(0, 6)}...${to.slice(-4)}`);
+  }
+  if (feeEstimate?.minFee) {
+    effects.push(`Estimated total fee: ${formatAssetAmount(feeEstimate.minFee, { decimals: 7 })} XLM`);
+  }
+
+  return {
+    contractId: CONTRACT_ID,
+    operation,
+    token: 'XLM',
+    amountStroops: amount,
+    amountFormatted,
+    feeEstimate,
+    network,
+    account,
+    recipient,
+    expectedEffects: effects,
+    simulationTimestamp: Date.now(),
+  };
+}
+
 /**
  * Deposits `amount` stroops of the bridged token from `publicKey` into the smart contract.
  *
@@ -278,6 +343,7 @@ export async function depositToContract(
   signTx: (xdr: string) => Promise<string>,
   onHashKnown?: (hash: string) => void,
 ): Promise<string> {
+  assertWriteNetworkPinning('TESTNET', 'TESTNET');
   await validateBridgeAmountLimit(amount);
   const op = fiatBridgeClient.buildDepositOperation(publicKey, amount);
   const { assembledXdr } = await buildAndSimulate(publicKey, op);
@@ -298,7 +364,13 @@ export async function withdrawFromContract(
   signTx: (xdr: string) => Promise<string>,
   onHashKnown?: (hash: string) => void,
 ): Promise<string> {
-  const op = fiatBridgeClient.buildWithdrawOperation(recipientPublicKey, amount);
+  assertWriteNetworkPinning('TESTNET', 'TESTNET');
+  const contract = new Contract(CONTRACT_ID);
+  const op = contract.call(
+    'withdraw',
+    new Address(recipientPublicKey).toScVal(),
+    nativeToScVal(amount, { type: 'i128' }),
+  );
   const { assembledXdr } = await buildAndSimulate(adminPublicKey, op);
   const signed = await signTx(assembledXdr);
   const hash = await submitAndWait(signed, onHashKnown);
@@ -315,37 +387,37 @@ async function viewCall<T>(functionName: string): Promise<T> {
   if (cached !== undefined) {
     return cached;
   }
-  // Use a dummy account (Stellar Foundation's well-known testnet account) for cls
-  const contract = new Contract(CONTRACT_ID);
 
-  // We don't need a funded account — just a valid one for building the tx
-  let account;
-  try {
-    account = await server.getAccount(DUMMY_SOURCE);
-  } catch {
-    // If testnet doesn't know the account, create a skeleton account object
-    const { Account } = await import('@stellar/stellar-sdk');
-    account = new Account(DUMMY_SOURCE, '0');
-  }
+  return withResilientRpcRead('TESTNET', async (activeServer) => {
+    const contract = new Contract(CONTRACT_ID);
 
-  const tx = new TransactionBuilder(account, {
-    fee: BASE_FEE,
-    networkPassphrase: NETWORK_PASSPHRASE,
-  })
-    .addOperation(contract.call(functionName))
-    .setTimeout(30)
-    .build();
+    let account;
+    try {
+      account = await activeServer.getAccount(DUMMY_SOURCE);
+    } catch {
+      const { Account } = await import('@stellar/stellar-sdk');
+      account = new Account(DUMMY_SOURCE, '0');
+    }
 
-  const sim = await server.simulateTransaction(tx);
-  if (rpc.Api.isSimulationError(sim)) {
-    throw new Error(`View call failed: ${sim.error}`);
-  }
-  const retval = (sim as rpc.Api.SimulateTransactionSuccessResponse).result
-    ?.retval;
-  if (!retval) throw new Error('No return value');
-  const result = scValToNative(retval) as T;
-  setCachedValue(functionName, result);
-  return result;
+    const tx = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: NETWORK_PASSPHRASE,
+    })
+      .addOperation(contract.call(functionName))
+      .setTimeout(30)
+      .build();
+
+    const sim = await activeServer.simulateTransaction(tx);
+    if (rpc.Api.isSimulationError(sim)) {
+      throw new Error(`View call failed: ${sim.error}`);
+    }
+    const retval = (sim as rpc.Api.SimulateTransactionSuccessResponse).result
+      ?.retval;
+    if (!retval) throw new Error('No return value');
+    const result = scValToNative(retval) as T;
+    setCachedValue(functionName, result);
+    return result;
+  });
 }
 
 /** Returns the current token balance (in stroops) held by the bridge contract. */
