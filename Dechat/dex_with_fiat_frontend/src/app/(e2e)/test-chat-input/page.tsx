@@ -37,6 +37,82 @@ const STATUS_LABEL: Record<FactStatus, string> = {
 };
 
 /**
+ * Supported locales for locale-aware intent evaluation.
+ *
+ * Each entry declares representative examples for amounts, decimal/grouping
+ * separators, currencies, and ambiguity cases. Language interpretation is kept
+ * separate from canonical parsing and contract unit conversion so transaction
+ * arithmetic stays deterministic and unchanged.
+ */
+type LocaleCode = 'en-US' | 'de-DE' | 'fr-FR' | 'ja-JP';
+
+interface LocaleExample {
+  /** Raw user utterance in this locale. */
+  utterance: string;
+  /** Canonical amount after deterministic parsing, or null if withheld. */
+  canonicalAmount: number | null;
+  /** ISO 4217 currency code resolved from the utterance, or null if ambiguous. */
+  currency: string | null;
+  /** True when the input must be withheld for clarification. */
+  ambiguous: boolean;
+}
+
+interface LocaleSpec {
+  code: LocaleCode;
+  label: string;
+  decimalSeparator: '.' | ',';
+  groupingSeparator: ',' | '.' | ' ';
+  examples: LocaleExample[];
+}
+
+const SUPPORTED_LOCALES: LocaleSpec[] = [
+  {
+    code: 'en-US',
+    label: 'English (United States)',
+    decimalSeparator: '.',
+    groupingSeparator: ',',
+    examples: [
+      { utterance: 'swap 1,234.56 USDC to ETH', canonicalAmount: 1234.56, currency: 'USDC', ambiguous: false },
+      { utterance: 'send 100 dollars', canonicalAmount: 100, currency: 'USD', ambiguous: false },
+      { utterance: 'swap 50 $ to ETH', canonicalAmount: 50, currency: null, ambiguous: true },
+    ],
+  },
+  {
+    code: 'de-DE',
+    label: 'German (Germany)',
+    decimalSeparator: ',',
+    groupingSeparator: '.',
+    examples: [
+      { utterance: 'tausche 1.234,56 USDC in ETH', canonicalAmount: 1234.56, currency: 'USDC', ambiguous: false },
+      { utterance: 'sende 100 Euro', canonicalAmount: 100, currency: 'EUR', ambiguous: false },
+      { utterance: 'tausche 50 $ in ETH', canonicalAmount: 50, currency: null, ambiguous: true },
+    ],
+  },
+  {
+    code: 'fr-FR',
+    label: 'French (France)',
+    decimalSeparator: ',',
+    groupingSeparator: ' ',
+    examples: [
+      { utterance: 'échanger 1 234,56 USDC contre ETH', canonicalAmount: 1234.56, currency: 'USDC', ambiguous: false },
+      { utterance: 'envoyer 100 euros', canonicalAmount: 100, currency: 'EUR', ambiguous: false },
+      { utterance: 'échanger 50 $ contre ETH', canonicalAmount: 50, currency: null, ambiguous: true },
+    ],
+  },
+  {
+    code: 'ja-JP',
+    label: 'Japanese (Japan)',
+    decimalSeparator: '.',
+    groupingSeparator: ',',
+    examples: [
+      { utterance: '1,234.56 USDC を ETH に交換', canonicalAmount: 1234.56, currency: 'USDC', ambiguous: false },
+      { utterance: '100 円 を送金', canonicalAmount: 100, currency: 'JPY', ambiguous: false },
+      { utterance: '50 $ を ETH に交換', canonicalAmount: 50, currency: null, ambiguous: true },
+    ],
+  },
+];
+
+/**
  * Test harness page for ChatInput E2E tests.
  *
  * Exposes a controlled form around ChatInput so tests can verify sending,
@@ -108,6 +184,38 @@ export default function TestChatInputPage() {
           </li>
         ))}
       </ul>
+
+      {/* Locale-aware intent evaluation fixtures for offline evaluation.
+          Language interpretation is separate from canonical parsing and
+          contract unit conversion; ambiguous or unsupported input is withheld. */}
+      <section data-testid="locale-eval" className="mb-4 text-xs text-gray-600">
+        <h2 className="text-sm font-semibold mb-1">Locale intent evaluation</h2>
+        {SUPPORTED_LOCALES.map((locale) => (
+          <div key={locale.code} data-testid={`locale-${locale.code}`} className="mb-2">
+            <p className="font-medium">
+              {locale.label} (decimal &quot;{locale.decimalSeparator}&quot;, grouping
+              &quot;{locale.groupingSeparator}&quot;)
+            </p>
+            <ul className="ml-4 list-disc">
+              {locale.examples.map((ex, i) => (
+                <li
+                  key={i}
+                  data-testid={`locale-example-${locale.code}-${i}`}
+                  data-ambiguous={ex.ambiguous}
+                >
+                  {ex.utterance} →{' '}
+                  {ex.ambiguous
+                    ? 'withheld for clarification'
+                    : `${ex.canonicalAmount} ${ex.currency}`}
+                </li>
+              ))}
+            </ul>
+          </div>
+        ))}
+        <p data-testid="locale-unsupported" className="italic">
+          Unsupported languages are withheld for clarification rather than guessed.
+        </p>
+      </section>
 
       {cancelled && (
         <p data-testid="cancel-notice" className="text-xs text-amber-600 mb-2">
