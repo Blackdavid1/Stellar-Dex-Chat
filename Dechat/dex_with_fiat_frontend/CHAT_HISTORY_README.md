@@ -1,90 +1,80 @@
-# Chat History Implementation Summary
+# Chat History & AI Intent Evaluation
 
-## Features Added
+This document describes how the chat layer interprets user messages, how
+amounts are validated, and how locale-aware intent evaluation works without
+affecting transaction arithmetic.
 
-### 1. **Chat Session Management**
-- **Automatic session creation**: Each new chat conversation is automatically saved as a session
-- **Session persistence**: All chat sessions are stored in localStorage for persistence across browser sessions
-- **Session metadata**: Each session includes title, creation date, last updated time, and associated wallet address
+## Locale-aware intent evaluation (issue #108)
 
-### 2. **Chat History Storage**
-- **Local Storage**: Uses browser localStorage for offline persistence (no backend required)
-- **Smart storage management**: Limits to 50 sessions maximum to prevent storage overflow
-- **Automatic cleanup**: Removes oldest sessions when limit is reached
-- **Data serialization**: Properly handles Date objects and complex message metadata
+Language interpretation is deliberately separated from canonical parsing and
+contract unit conversion. The pipeline is:
 
-### 3. **History Sidebar**
-- **Toggle button**: Fixed position button to open/close chat history sidebar
-- **Session list**: Shows all saved chat sessions with titles and timestamps
-- **Search functionality**: Real-time search through session titles and message content
-- **Session actions**: Export individual sessions, delete sessions with confirmation
-- **Visual indicators**: Shows current active session, message count, and time since last update
+1. **Language interpretation** — detect the user's locale and extract the
+   intent (e.g. "send", "swap") plus the raw amount/currency tokens as the
+   user typed them. This stage is best-effort and never produces a final
+   numeric value.
+2. **Canonical parsing** — normalize the extracted tokens into a canonical
+   decimal string using the declared locale rules below. This stage is
+   deterministic and locale-driven.
+3. **Contract unit conversion** — convert the canonical decimal into base
+   units (e.g. wei) using the token's decimals. This stage is unchanged and
+   remains the single source of truth for transaction arithmetic.
 
-### 4. **Session Navigation**
-- **Load any session**: Click on any session to load its complete message history
-- **Automatic title generation**: Session titles are auto-generated from first user message
-- **New chat creation**: "New Chat" button to start fresh conversations
-- **Clear all history**: Option to completely clear all stored chat history
+Because stages 2 and 3 are deterministic and independent of the language
+model, adding new languages cannot change how amounts are computed.
 
-### 5. **Export Functionality**
-- **JSON export**: Export individual chat sessions as JSON files
-- **Complete conversation data**: Includes all messages, timestamps, and metadata
-- **Download management**: Automatic file download with proper naming
+## Supported locales
 
-## File Structure
+Each locale declares its decimal separator, grouping separator, and the
+representative examples used by the offline evaluations.
 
-```
-src/
-├── types/index.ts              # Added ChatSession and ChatHistoryState types
-├── lib/chatHistory.ts          # Chat history management utilities
-├── hooks/
-│   ├── useChat.ts             # Updated to integrate with history
-│   └── useChatHistory.ts      # New hook for history management
-└── components/
-    ├── ChatInterface.tsx      # Updated to include history sidebar
-    ├── ChatHistorySidebar.tsx # New history sidebar component
-    └── WalletConnection.tsx   # Added "New Chat" button
-```
+| Locale | Decimal sep | Grouping sep | Example amount | Parsed canonical | Currency example |
+| ------ | ----------- | ------------ | -------------- | ---------------- | ---------------- |
+| `en-US` | `.` | `,` | `1,234.56` | `1234.56` | `$1,234.56` → USD |
+| `en-GB` | `.` | `,` | `1,234.56` | `1234.56` | `£1,234.56` → GBP |
+| `de-DE` | `,` | `.` | `1.234,56` | `1234.56` | `1.234,56 €` → EUR |
+| `fr-FR` | `,` | narrow no-break space | `1 234,56` | `1234.56` | `1 234,56 €` → EUR |
+| `es-ES` | `,` | `.` | `1.234,56` | `1234.56` | `1.234,56 €` → EUR |
+| `ja-JP` | `.` | `,` | `1,234.56` | `1234.56` | `¥1,234` → JPY |
 
-## Usage
+### Ambiguity examples
 
-### For Users:
-1. **View History**: Click the history icon (📖) on the left side to open chat history
-2. **Search Chats**: Type in the search box to find specific conversations
-3. **Load Old Chat**: Click on any session to continue that conversation
-4. **Start New Chat**: Click "New Chat" button in the header
-5. **Export Chat**: Hover over a session and click the download icon
-6. **Delete Chat**: Hover over a session and click the trash icon
+- `1.234` in `de-DE`/`es-ES` is a grouping form → `1234`.
+- `1.234` in `en-US` is a decimal form → `1.234`.
+- `1,234` in `en-US` is a grouping form → `1234`.
+- `1,234` in `de-DE` is a decimal form → `1.234`.
+- A bare `$` is ambiguous across USD/CAD/AUD and must be resolved by the
+  declared locale or withheld for clarification.
 
-### For Developers:
-```typescript
-// Access chat history in components
-const { 
-  sessions, 
-  currentSessionId, 
-  loadSession, 
-  deleteSession,
-  searchSessions 
-} = useChatHistory();
+## Edge cases
 
-// The useChat hook now automatically saves to history
-const { messages, sendMessage, clearChat, loadChatSession } = useChat();
-```
+### Mixed-locale input
 
-## Storage Details
+When the detected language and the amount formatting disagree (e.g. an
+`en-US` sentence containing `1.234,56`), the parser does **not** guess. The
+intent is withheld and the user is asked to confirm the amount.
 
-- **Key**: `defi_chat_history`
-- **Max Sessions**: 50 (configurable in `chatHistory.ts`)
-- **Storage Size**: Approximately 1-5MB depending on chat length
-- **Cleanup**: Automatic removal of oldest sessions when limit exceeded
+### Ambiguous currency symbols
 
-## Future Enhancements
+Symbols shared by multiple currencies (`$`, `¥`) are only resolved when the
+locale unambiguously maps to a single currency. Otherwise the request is
+withheld for clarification.
 
-1. **Cloud Sync**: Add backend integration for cross-device synchronization
-2. **Tags/Categories**: Allow users to tag and categorize chat sessions
-3. **Advanced Search**: Add filters by date range, transaction type, etc.
-4. **Backup/Restore**: Bulk export/import functionality
-5. **Session Sharing**: Share interesting conversations with others
-6. **Analytics**: Track usage patterns and popular queries
+### Unsupported languages
 
-The implementation is fully functional and provides a robust chat history system without requiring any backend infrastructure.
+If the detected locale is not in the supported table above, the intent is
+withheld for clarification rather than falling back to a default locale.
+
+## Diagnostics
+
+Diagnostics and logs record only the locale, the resolved intent kind, and a
+coarse outcome (`parsed`, `withheld`, `unsupported`). They never include the
+raw user prompt or the extracted amount tokens, so sensitive input is not
+persisted in logs.
+
+## Validation
+
+Offline evaluations run per locale against the representative examples in the
+table. For every case the parsed value must either match the deterministic
+canonical parsing result or be withheld for clarification; no evaluation may
+produce a value that differs from canonical parsing.

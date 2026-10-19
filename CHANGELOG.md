@@ -429,6 +429,13 @@ Repo Avatar
 - **frontend:** Add CSP and security headers in next.config.ts
 - **contract:** Include caller and ledger in deposit, withdraw, set_limit, set_operator events
 - **frontend:** Add dynamic theme tokens to NotificationsCenter.tsx
+- **api:** Payout timeout budgets, IDOR auth matrix, credential rotation, and sandbox lifecycle (#98, #104, #105, #106)
+- **frontend:** Implement transfer timeline, cross-tab payout coordination, session recovery, and resilient RPC
+- **api:** Circuit breaker, race-safe recipients, reconciliation, and security hardening (#47, #48, #49, #50)
+- **contract:** Add explicit cancellation/refund lifecycle for pending withdrawals
+- **api:** Durable webhook deduplication, out-of-order reconciliation, retry queue, and append-only audit ledger (#35, #36, #37, #38)
+- **contract:** Multisig rotation, role capabilities, bounded heartbeat, and rate limits (#19, #20, #21, #22)
+- Implement payout PII retention, simulation pre-sign review, pending tx recovery, and exact integer arithmetic (#51, #52, #53, #55)
 
 ### Fixed
 
@@ -902,6 +909,10 @@ Repo Avatar
 - **frontend:** Remove duplicate closing p tag in LandingPage
 - **frontend:** Remove unused CheckCircle import from LandingPage
 - **frontend:** Address issues 1510, 1513, 1515, 1518
+- #107 feat(ai): show source and timestamp for factual rate and payou
+- #108 feat(ai): add locale-aware intent evaluation without changing
+- #109 feat(ai): add deterministic conversation replay for incident d
+- #110 perf(ai): add bounded timeouts and cancellation for model requ
 
 ### Changed
 
@@ -1215,6 +1226,14 @@ Repo Avatar
 - **changelog:** Update changelog [skip ci]
 - **changelog:** Update changelog [skip ci]
 - **contract:** Add Soroban invariant tests for get_fee_withdrawal_nonce
+- **changelog:** Update changelog [skip ci]
+- **changelog:** Update changelog [skip ci]
+- **contract:** Add stateful property-based escrow solvency harness
+- **changelog:** Update changelog [skip ci]
+- **deps:** Bump proptest
+- **changelog:** Update changelog [skip ci]
+- **changelog:** Update changelog [skip ci]
+- **changelog:** Update changelog [skip ci]
 - **changelog:** Update changelog [skip ci]
 
 ### Deprecated
@@ -1777,3 +1796,6 @@ fix(frontend): add minimal security hardening for webhook and transfe…
 - Merge pull request #1563 from Mrwicks00/fix/1455-1458-1478-1479-ci-security-hardening
 
 Fix/1455 1458 1478 1479 ci security hardening
+- Merge pull request #154 from softnationz/feat/issues-47-48-49-50
+
+feat(api): circuit breaker, race-safe recipients, reconciliation, and security hardening (#47, #48, #49, #50)

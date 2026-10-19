@@ -1,5 +1,6 @@
 import axios from 'axios';
-import { serverEnv as env } from '@/lib/serverEnv';
+import { credentialManager } from '../credentialManager';
+import { executeWithTimeoutBudget } from '../timeoutBudget';
 
 import type {
   CreateRecipientInput,
@@ -13,15 +14,13 @@ import type {
   VerifyAccountResult,
 } from './types';
 
-const PAYSTACK_SECRET_KEY = env.PAYSTACK_SECRET_KEY;
-
 export function toKobo(amountNgn: number): number {
   return Math.round(amountNgn * 100);
 }
 
-function paystackHeaders() {
+function paystackHeaders(secretKey?: string) {
   return {
-    Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`,
+    Authorization: `Bearer ${secretKey}`,
     'Content-Type': 'application/json',
   };
 }
@@ -31,8 +30,9 @@ export const paystackProvider: PayoutProvider = {
 
   async verifyAccount(input: VerifyAccountInput): Promise<VerifyAccountResult> {
     const { accountNumber, bankCode } = input;
+    const cred = credentialManager.getActiveCredential();
 
-    if (!PAYSTACK_SECRET_KEY) {
+    if (!cred || !cred.secretKey) {
       console.warn('Paystack secret key not found, using mock verification');
 
       const mockVerification: VerifyAccountResult = {
@@ -41,30 +41,45 @@ export const paystackProvider: PayoutProvider = {
         bank_id: Number.parseInt(bankCode, 10),
       };
 
-      await new Promise((resolve) => setTimeout(resolve, 1000));
+      await new Promise((resolve) => setTimeout(resolve, 500));
       return mockVerification;
     }
 
-    const response = await axios.get('https://api.paystack.co/bank/resolve', {
-      headers: paystackHeaders(),
-      params: { account_number: accountNumber, bank_code: bankCode },
-    });
+    return await executeWithTimeoutBudget(
+      'verify',
+      async (signal, phaseNotifier) => {
+        const response = await axios.get(
+          'https://api.paystack.co/bank/resolve',
+          {
+            headers: paystackHeaders(cred.secretKey),
+            params: { account_number: accountNumber, bank_code: bankCode },
+            signal,
+          },
+        );
 
-    if (response.data?.status && response.data?.data) {
-      return {
-        account_number: response.data.data.account_number,
-        account_name: response.data.data.account_name,
-        bank_id: Number.parseInt(bankCode, 10),
-      };
-    }
+        phaseNotifier?.markConnected();
 
-    throw new Error(response.data?.message || 'Account verification failed');
+        if (response.data?.status && response.data?.data) {
+          return {
+            account_number: response.data.data.account_number,
+            account_name: response.data.data.account_name,
+            bank_id: Number.parseInt(bankCode, 10),
+          };
+        }
+
+        throw new Error(
+          response.data?.message || 'Account verification failed',
+        );
+      },
+    );
   },
 
   async createRecipient(
     input: CreateRecipientInput,
   ): Promise<CreateRecipientResult> {
-    if (!PAYSTACK_SECRET_KEY) {
+    const cred = credentialManager.getActiveCredential();
+
+    if (!cred || !cred.secretKey) {
       console.warn(
         'Paystack secret key not found, using mock recipient creation',
       );
@@ -90,29 +105,40 @@ export const paystackProvider: PayoutProvider = {
         },
       };
 
-      await new Promise((resolve) => setTimeout(resolve, 1000));
+      await new Promise((resolve) => setTimeout(resolve, 500));
       return mockRecipient;
     }
 
-    const response = await axios.post(
-      'https://api.paystack.co/transferrecipient',
-      input,
-      {
-        headers: paystackHeaders(),
+    return await executeWithTimeoutBudget(
+      'recipient',
+      async (signal, phaseNotifier) => {
+        const response = await axios.post(
+          'https://api.paystack.co/transferrecipient',
+          input,
+          {
+            headers: paystackHeaders(cred.secretKey),
+            signal,
+          },
+        );
+
+        phaseNotifier?.markConnected();
+
+        if (response.data?.status && response.data?.data) {
+          return response.data.data;
+        }
+
+        throw new Error(response.data?.message || 'Failed to create recipient');
       },
     );
-
-    if (response.data?.status && response.data?.data) {
-      return response.data.data;
-    }
-
-    throw new Error(response.data?.message || 'Failed to create recipient');
   },
 
   async initiateTransfer(
     input: InitiateTransferInput,
   ): Promise<InitiateTransferResult> {
-    if (!PAYSTACK_SECRET_KEY) {
+    const cred = credentialManager.getActiveCredential();
+    const credentialVersion = cred?.version || input.credentialVersion || 'v1';
+
+    if (!cred || !cred.secretKey) {
       console.warn(
         'Paystack secret key not found, using mock transfer initiation',
       );
@@ -133,9 +159,10 @@ export const paystackProvider: PayoutProvider = {
         id: Math.floor(Math.random() * 1000000),
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
+        credentialVersion,
       };
 
-      await new Promise((resolve) => setTimeout(resolve, 1500));
+      await new Promise((resolve) => setTimeout(resolve, 500));
       return mockTransfer;
     }
 
@@ -147,27 +174,43 @@ export const paystackProvider: PayoutProvider = {
       reference: input.reference,
     };
 
-    const response = await axios.post(
-      'https://api.paystack.co/transfer',
-      transferData,
-      {
-        headers: paystackHeaders(),
+    return await executeWithTimeoutBudget(
+      'initiate',
+      async (signal, phaseNotifier) => {
+        const response = await axios.post(
+          'https://api.paystack.co/transfer',
+          transferData,
+          {
+            headers: paystackHeaders(cred.secretKey),
+            signal,
+          },
+        );
+
+        phaseNotifier?.markConnected();
+
+        if (response.data?.status && response.data?.data) {
+          return {
+            ...response.data.data,
+            credentialVersion,
+          };
+        }
+
+        throw new Error(
+          response.data?.message || 'Failed to initiate transfer',
+        );
       },
+      { reference: input.reference },
     );
-
-    if (response.data?.status && response.data?.data) {
-      return response.data.data;
-    }
-
-    throw new Error(response.data?.message || 'Failed to initiate transfer');
   },
 
   async checkTransferStatus(
     input: TransferStatusInput,
   ): Promise<TransferStatusResult> {
-    const { reference } = input;
+    const { reference, credentialVersion } = input;
+    // Look up versioned credential for existing in-flight intent, or fallback to active
+    const cred = credentialManager.getCredential(credentialVersion);
 
-    if (!PAYSTACK_SECRET_KEY) {
+    if (!cred || !cred.secretKey) {
       console.warn('Paystack secret key not found, using mock transfer status');
 
       const mockStatus = {
@@ -176,26 +219,39 @@ export const paystackProvider: PayoutProvider = {
         data: {
           reference,
           status: 'pending',
+          credentialVersion: credentialVersion || 'v1',
         },
       };
 
-      await new Promise((resolve) => setTimeout(resolve, 700));
+      await new Promise((resolve) => setTimeout(resolve, 500));
       return mockStatus;
     }
 
-    const response = await axios.get(
-      `https://api.paystack.co/transfer/verify/${reference}`,
-      {
-        headers: paystackHeaders(),
+    return await executeWithTimeoutBudget(
+      'status',
+      async (signal, phaseNotifier) => {
+        const response = await axios.get(
+          `https://api.paystack.co/transfer/verify/${reference}`,
+          {
+            headers: paystackHeaders(cred.secretKey),
+            signal,
+          },
+        );
+
+        phaseNotifier?.markConnected();
+
+        if (response.data?.status && response.data?.data) {
+          return {
+            ...response.data.data,
+            credentialVersion: cred.version,
+          };
+        }
+
+        throw new Error(
+          response.data?.message || 'Failed to fetch transfer status',
+        );
       },
-    );
-
-    if (response.data?.status && response.data?.data) {
-      return response.data.data;
-    }
-
-    throw new Error(
-      response.data?.message || 'Failed to fetch transfer status',
+      { reference },
     );
   },
 };

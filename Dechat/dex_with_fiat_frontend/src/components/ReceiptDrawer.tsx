@@ -10,6 +10,7 @@ import {
   AlertCircle,
   Trash2,
   Printer,
+  Loader2,
 } from 'lucide-react';
 import { TransactionHistoryEntry } from '@/types';
 import { useTranslation } from '@/contexts/TranslationContext';
@@ -19,11 +20,17 @@ import { FilterChipBar } from './filters/FilterChipBar';
 import SkeletonReceipt from '../components/ui/skeleton/SkeletonReceipt';
 import ReceiptQrCode from './ReceiptQrCode';
 
-interface ReceiptDrawerProps {
+export interface ReceiptDrawerProps {
   isOpen: boolean;
   onClose: () => void;
   transactions: TransactionHistoryEntry[];
   onClearHistory?: () => void;
+  hasMore?: boolean;
+  isLoadingMore?: boolean;
+  isEndOfHistory?: boolean;
+  paginationError?: string | null;
+  onLoadMore?: () => void;
+  onRetryPagination?: () => void;
 }
 
 function getReceiptQrValue(tx: TransactionHistoryEntry): string {
@@ -180,6 +187,12 @@ export default function ReceiptDrawer({
   onClose,
   transactions,
   onClearHistory,
+  hasMore = false,
+  isLoadingMore = false,
+  isEndOfHistory = false,
+  paginationError = null,
+  onLoadMore,
+  onRetryPagination,
 }: ReceiptDrawerProps) {
   const { t } = useTranslation();
   const { isDarkMode } = useTheme();
@@ -434,6 +447,58 @@ export default function ReceiptDrawer({
                   </div>
                 </div>
               ))
+            )}
+
+            {/* Pagination Controls (#61) */}
+            {paginationError && (
+              <div
+                data-testid="pagination-error"
+                className="p-3 rounded-lg border border-red-500/30 bg-red-500/10 text-xs text-red-400 flex items-center justify-between"
+              >
+                <span>{paginationError}</span>
+                {onRetryPagination && (
+                  <button
+                    type="button"
+                    data-testid="pagination-retry-btn"
+                    onClick={onRetryPagination}
+                    className="underline hover:text-red-300 font-medium ml-2 shrink-0"
+                  >
+                    Retry
+                  </button>
+                )}
+              </div>
+            )}
+
+            {hasMore && !isLoadingMore && onLoadMore && (
+              <div className="pt-2 text-center">
+                <button
+                  type="button"
+                  data-testid="load-more-btn"
+                  onClick={onLoadMore}
+                  className="w-full py-2 px-4 rounded-lg border border-gray-300 dark:border-gray-700 text-xs font-semibold text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors"
+                >
+                  Load More Transactions
+                </button>
+              </div>
+            )}
+
+            {isLoadingMore && (
+              <div
+                data-testid="loading-more-spinner"
+                className="flex items-center justify-center gap-2 py-3 text-xs text-gray-400"
+              >
+                <Loader2 className="w-4 h-4 animate-spin text-blue-500" />
+                <span>Loading more transactions…</span>
+              </div>
+            )}
+
+            {isEndOfHistory && displayTransactions.length > 0 && (
+              <div
+                data-testid="end-of-history"
+                className="py-3 text-center text-[11px] text-gray-500 tracking-wide uppercase"
+              >
+                End of transaction history
+              </div>
             )}
           </div>
 

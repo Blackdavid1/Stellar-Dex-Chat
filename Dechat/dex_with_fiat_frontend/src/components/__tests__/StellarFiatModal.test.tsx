@@ -65,7 +65,6 @@ const onClose = vi.fn();
 const onDepositSuccess = vi.fn();
 
 describe('StellarFiatModal', () => {
-  let mockedContract: any;
   let mockedContract: {
     depositToContract: Mock;
     withdrawFromContract: Mock;
@@ -307,8 +306,9 @@ describe('StellarFiatModal fee simulation debounce', () => {
       }),
     );
 
-    // Wait for initial render
-    await vi.runAllTimersAsync();
+    // Wait for initial render and UI loading timer
+    await vi.advanceTimersByTimeAsync(600);
+    mockedContract.simulateDeposit.mockClear();
 
     // Simulate typing "1000.5" character by character
     const input = getByRole('spinbutton') as HTMLInputElement;
@@ -351,7 +351,8 @@ describe('StellarFiatModal fee simulation debounce', () => {
       }),
     );
 
-    await vi.runAllTimersAsync();
+    await vi.advanceTimersByTimeAsync(600);
+    mockedContract.simulateDeposit.mockClear();
 
     const input = getByRole('spinbutton') as HTMLInputElement;
     
